@@ -1,0 +1,16 @@
+set(FREERTOS_HEAP 3)
+# set(FREERTOS_PORT GCC_ARM_CM4F)
+
+add_library(freertos_config INTERFACE)
+target_include_directories(freertos_config SYSTEM INTERFACE config)
+
+add_subdirectory(FreeRTOS-KernelV11.3.1)
+
+add_library(freertos_headers INTERFACE)
+target_link_libraries(freertos_headers INTERFACE freertos_config freertos_kernel_include freertos_kernel_port_headers)
+
+target_link_libraries(freertos_config INTERFACE xeno_headers)
+target_link_libraries(freertos_kernel_include INTERFACE xeno_headers)
+target_link_libraries(freertos_kernel_port_headers INTERFACE xeno_headers)
+
+target_sources(freertos_kernel PRIVATE freertos.cc)
