@@ -1,7 +1,7 @@
 #pragma once
 
 #include"vfs.h"
-
+#include"path.h"
 #include<flat_map>
 #include<mutex>
 
@@ -60,15 +60,14 @@ class devfs: public ifs
 {
     friend class devfile;
 
-    std::flat_map<fs::path, devfile*> devfiles;
+    std::flat_map<path, devfile*> devfiles;
     std::recursive_mutex mutex;
 public:
     using file_type = devfile;
 
-    int mknod(fs::path p, devfile *file)
+    int mknod(path p, devfile *file)
     {
         std::lock_guard _{mutex};
-        p = path_absolute_normal(p);
         if(devfiles.contains(p))
         {
             errno = EBUSY;
@@ -83,7 +82,7 @@ public:
     int open(const char *path, int mode) override
     {
         std::lock_guard _{mutex};
-        auto p = path_absolute_normal(path);
+        xeno::path p = path;
         if(devfiles.contains(p))
         {
             return devfiles[p]->open(path, mode);

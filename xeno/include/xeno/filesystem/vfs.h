@@ -3,17 +3,18 @@
 #include<vector>
 #include<string>
 #include<flat_map>
-#include<filesystem>
 #include<mutex>
 #include<experimental/scope>
 
 #include<unistd.h>
 #include<fcntl.h>
 #include<sys/stat.h>
+#include<errno.h>
+
+#include"path.h"
 
 namespace xeno
 {
-namespace fs = std::filesystem;
 
 class vfs;
 
@@ -126,6 +127,97 @@ public:
     }
 };
 
+// open file description
+class ofd
+{
+    static constexpr size_t limits = 1024;
+    std::vector<ifile*> v;
+
+    int expand(size_t n)
+    {
+        if(v.size() >= limits)
+        {
+            errno = ENFILE;
+            return -1;
+        }
+
+        size_t size = std::max(n, v.size() + v.size()/2);
+        size = std::min(size, limits);
+        v.resize(size, nullptr);
+        return 0;
+    }
+
+public:
+    int allocate(ifile *f, int fd)
+    {
+        if(fd < 0 || (size_t)fd >= limits)
+        {
+            errno = EBADF;
+            return -1;
+        }
+
+        if((size_t)fd < v.size())
+        {
+            if(v[fd] == nullptr)
+            {
+                v[fd] = f;
+                return fd;
+            }
+            errno = EBUSY;
+            return -1;
+        }
+
+        if(expand((size_t)fd + 1) == -1)
+            return -1;
+
+        if((size_t)fd >= v.size())
+        {
+            errno = EMFILE;
+            return -1;
+        }
+
+        v[fd] = f;
+        return fd;
+    }
+
+    int allocate(ifile *f)
+    {
+        size_t i;
+        for(i = 3; i < v.size(); i++)
+        {
+            if(v[i] == nullptr)
+            {
+                v[i] = f;
+                return (int)i;
+            }
+        }
+        if(expand(i + 1) == -1)
+            return -1;
+        v[i] = f;
+        return (int)i;
+    }
+
+    int deallocate(int fd)
+    {
+        if(fd >= 0 && fd < v.size())
+        {
+            v[fd] = nullptr;
+            return 0;
+        }
+        errno = EBADF;
+        return -1;
+    }
+
+    ifile* operator[](int fd)
+    {
+        if(fd >= 0 && fd < v.size())
+        {
+            return v[fd];
+        }
+        return nullptr;
+    }
+};
+
 class fdallocator
 {
     std::flat_map<int, ifile*> pool;
@@ -162,60 +254,42 @@ public:
     }
 };
 
-
-inline fs::path path_absolute_normal(fs::path path)
-{
-    path = "/" / path;
-    return path.lexically_normal();
-}
-
-inline fs::path path_relative(const fs::path &path, const fs::path &base)
-{
-    return path_absolute_normal(path).lexically_relative(path_absolute_normal(base));
-}
-
-inline bool path_is_within(const fs::path &path, const fs::path &base)
-{
-    std::string relative = path_relative(path, base);
-    if(relative.empty())
-        return true;
-    if(relative.size() >= 2 && relative[0] == '.' && relative[1] == '.')
-        return false;
-    return true;
-}
-
 // virtual filesystem
 class vfs final
 {
     friend class ifs;
-    std::flat_map<std::string, ifs*> mountpoints;
-    fdallocator fdmap;
+    std::flat_map<path, ifs*> mountpoints;
+    ofd fdmap;
     std::recursive_mutex mutex;
 
-    std::tuple<ifs*, std::string> get_ifs_and_prefix(fs::path path)
+    std::tuple<ifs*, std::string> get_ifs_and_prefix(path p)
     {
         std::lock_guard _{mutex};
-        
-        std::string p = path;
-        std::string prefix = {};
+        std::string_view path_str = p;
+        std::string_view prefix = {};
         ifs *fs = nullptr;
-        for(auto [mp, ifs]: mountpoints)
+
+        for(auto &&[mp, f]: mountpoints)
         {
-            if(path_is_within(p, mp))
-            {
-                if(mp.size() > prefix.size() || fs ==nullptr)
-                {
-                    prefix = mp;
-                    fs = ifs;
-                }
-            }
+            std::string_view mp_str = mp;
+            if(mp_str.size() < prefix.size() || mp_str.size() > path_str.size())
+                continue;
+            if(path_str.compare(0, mp_str.size(), mp_str) != 0)
+                continue;
+            if(mp_str.size() < path_str.size() && mp_str.back() != '/' && path_str[mp_str.size()] != '/')
+                continue;
+
+            prefix = mp_str;
+            fs = f;
         }
 
         if(fs == nullptr)
             return {};
-        auto relative = path_relative(path, prefix);
-        relative = path_absolute_normal(relative);
-        return {fs, relative};
+
+        std::string_view relative = prefix == "/" ? path_str : path_str.substr(prefix.size());
+        if(relative.empty())
+            relative = "/";
+        return {fs, std::string(relative)};
     }
 
     auto get_ifile(int fd)
@@ -253,35 +327,21 @@ public:
         return fdmap.deallocate(fd);
     }
 
-    int mount(ifs &f, fs::path dir)
+    int mount(ifs &f, path dir)
     {
-        if(!dir.is_absolute())
-        {
-            errno = EINVAL;
-            return -1;
-        }
-
-        dir = path_absolute_normal(dir);
         std::lock_guard _{mutex};
         if(mountpoints.contains(dir))
         {
             errno = EBUSY;
             return -1;
         }
-        mountpoints[dir.string()] = &f;
+        mountpoints[dir] = &f;
         f.vfsptr = this;
         return 0;
     }
 
-    int umount(fs::path dir)
+    int umount(path dir)
     {
-        if(!dir.is_absolute())
-        {
-            errno = EINVAL;
-            return -1;
-        }
-
-        dir = path_absolute_normal(dir);
         std::lock_guard _{mutex};
         if(mountpoints.contains(dir))
         {

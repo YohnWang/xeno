@@ -11,16 +11,20 @@ namespace xeno
 void filesystem_init();
 void filesystem_init_stdio();
 
+// vfs与devfs需要全局使用，不能进行析构，否则会出现析构完成后，stdio调用close
+
 inline auto& __get_vfs()
 {
-    static xeno::vfs vfs;
-    return vfs;
+    alignas(xeno::vfs) static char buf[sizeof(xeno::vfs)];
+    static xeno::vfs *ptr = new(buf) xeno::vfs;
+    return *ptr;
 }
 
 inline auto& __get_devfs()
 {
-    static xeno::devfs devfs;
-    return devfs;
+    alignas(xeno::devfs) static char buf[sizeof(xeno::devfs)];
+    static xeno::devfs *ptr = new(buf) xeno::devfs;
+    return *ptr;
 }
 
 #define __vfs xeno::__get_vfs()

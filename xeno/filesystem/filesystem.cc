@@ -6,7 +6,7 @@ namespace xeno
 
 void filesystem_init()
 {
-    std::once_flag flag;
+    static std::once_flag flag;
     std::call_once(flag, [](){__vfs.mount(__devfs, "/dev/");});
 }
 
