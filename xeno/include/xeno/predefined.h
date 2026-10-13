@@ -9,6 +9,7 @@ extern "C"{
 void __write_terminal(const char *s);
 void __init_tls(void *tp);
 size_t __get_tls_size();
+size_t __get_tls_data_offset();
 void __store_tls_tp(void *tp);
 void* __load_tls_tp();
 

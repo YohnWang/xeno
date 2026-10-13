@@ -140,6 +140,10 @@ SECTIONS
       *(.tcommon)
       __tbss_end = .;
    } > FLASH
+
+   __tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));
+   __tls_data_offset = MAX(__tls_align, 8);
+
   /*
    * SG veneers:
    * All SG veneers are placed in the special output section .gnu.sgstubs. Its start address
@@ -267,6 +271,14 @@ SECTIONS
     . = ALIGN(4);
     __bss_end__ = .;
   } > RAM AT > RAM
+
+  .main_tls (NOLOAD) :
+  {
+    . = ALIGN(__tls_data_offset);
+    __main_tls_start = .;
+    . = . + (__tbss_end - __tdata_start) + __tls_data_offset;
+    __main_tls_end = .;
+  } > RAM
 
   /*
    * Secondary bss section, optional
