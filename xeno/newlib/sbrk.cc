@@ -2,8 +2,7 @@
 #include<stdlib.h>
 #include<stdint.h>
 #include<unistd.h>
-#include<stacktrace.h>
-#include<charconv>
+#include<errno.h>
 #include<xeno/port.h>
 
 extern "C"
@@ -14,8 +13,9 @@ void* _sbrk_r(struct _reent *ptr, ptrdiff_t diff)
 
     static ptrdiff_t offset = 0;
 
-    if(offset + diff >= buf_size || offset < 0)
+    if(diff > buf_size - offset || offset + diff < 0)
     {
+        errno = ENOMEM;
         return (void*)-1;
     }
 
