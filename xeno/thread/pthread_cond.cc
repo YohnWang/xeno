@@ -23,7 +23,10 @@ int pthread_cond_broadcast(pthread_cond_t *cond)
 
 int pthread_cond_destroy(pthread_cond_t *cond)
 {
-    *cond == PTHREAD_COND_INITIALIZER;
+    if(__futex_get_wait_numbers(cond) > 0)
+        return EBUSY;
+
+    *cond = PTHREAD_COND_INITIALIZER;
     return 0;
 }
 

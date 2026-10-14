@@ -47,6 +47,14 @@ extern int sem_timedwait (sem_t *__restrict __sem,
 			  const struct timespec *__restrict __abstime)
   __nonnull ((1, 2));
 
+/* Wait for SEM being posted.  ABSTIME is measured by the clock CLOCKID,
+   which must be CLOCK_REALTIME or CLOCK_MONOTONIC.  Unlike sem_timedwait
+   (always CLOCK_REALTIME), passing CLOCK_MONOTONIC makes the wait immune
+   to clock_settime.  */
+extern int sem_clockwait (sem_t *__restrict __sem, clockid_t __clockid,
+			  const struct timespec *__restrict __abstime)
+  __nonnull ((1, 3));
+
 
 /* Test whether SEM is posted.  */
 extern int sem_trywait (sem_t *__sem) __nonnull ((1));

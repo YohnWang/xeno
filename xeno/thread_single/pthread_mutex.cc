@@ -1,4 +1,5 @@
 #include <pthread.h>
+#include <errno.h>
 
 int pthread_mutexattr_init(pthread_mutexattr_t *__attr)
 {
@@ -29,8 +30,8 @@ int pthread_mutexattr_gettype(const pthread_mutexattr_t *__attr, int *__kind)
 
 int pthread_mutexattr_settype(pthread_mutexattr_t *__attr, int __kind)
 {
-    if (__kind != PTHREAD_MUTEX_RECURSIVE || __kind != PTHREAD_MUTEX_NORMAL)
-        return -1;
+    if (__kind != PTHREAD_MUTEX_RECURSIVE && __kind != PTHREAD_MUTEX_NORMAL)
+        return EINVAL;
     __attr->type = __kind;
     return 0;
 }
@@ -46,6 +47,12 @@ int pthread_mutex_lock(pthread_mutex_t *m)
 }
 
 int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *ts)
+{
+    return 0;
+}
+
+int pthread_mutex_clocklock(pthread_mutex_t *__restrict m, clockid_t __clockid,
+                            const struct timespec *__restrict ts)
 {
     return 0;
 }

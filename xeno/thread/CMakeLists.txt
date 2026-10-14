@@ -13,6 +13,7 @@ target_sources(xeno_thread
         pthread_key.cc
         pthread_mutex.cc
         pthread_once.cc
+        pthread_rwlock.cc
         pthread.cc
         sched.cc
         sem.cc

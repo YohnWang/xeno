@@ -181,9 +181,26 @@ typedef __uint32_t pthread_spinlock_t;        /* POSIX Spin Lock Object */
 /* POSIX Reader/Writer Lock Types */
 
 #if defined(_POSIX_READER_WRITER_LOCKS)
-typedef __uint32_t pthread_rwlock_t;         /* POSIX RWLock Object */
 
-#define _PTHREAD_RWLOCK_INITIALIZER ((pthread_rwlock_t) 0xFFFFFFFF)
+/* POSIX RWLock Object
+
+   状态不用 FreeRTOS 句柄，全放在锁对象自己身上，所以 _PTHREAD_RWLOCK_INITIALIZER
+   可以是全 0：libstdc++ 的 std::shared_mutex 就是静态初始化一个 pthread_rwlock_t，
+   它不会调用 pthread_rwlock_init。
+       state           0 = 空闲，> 0 = 读者数，-1 = 写者持有
+       pending_writers 正在等待的写者数，> 0 时新的读者不再进入（写者优先）
+       event           futex 事件字，状态每次变化就自增并唤醒等待者
+       writer          写者任务句柄，解锁时用来检查持有者
+   （字段含义见 xeno/thread/pthread_rwlock.cc） */
+typedef struct pthread_rwlock_t
+{
+    int state;
+    int pending_writers;
+    int event;
+    TaskHandle_t writer;
+}pthread_rwlock_t;
+
+#define _PTHREAD_RWLOCK_INITIALIZER {0, 0, 0, NULL}
 
 typedef struct {
   int   is_initialized;       /* is this structure initialized? */

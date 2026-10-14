@@ -8,6 +8,7 @@ target_sources(xeno_thread_single
         pthread_mutex.cc
         pthread_cond.cc
         pthread_once.cc
+        pthread_rwlock.cc
         sched.cc
         sem.cc
         start.cc

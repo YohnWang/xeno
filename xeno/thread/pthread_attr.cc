@@ -38,7 +38,7 @@ int pthread_attr_setdetachstate(pthread_attr_t *attr, int detachstate)
 
 int pthread_attr_setstacksize(pthread_attr_t *attr, size_t stacksize)
 {
-    if(stacksize < configMINIMAL_STACK_SIZE)
+    if(stacksize < (size_t)configMINIMAL_STACK_SIZE * sizeof(StackType_t))
         return EINVAL;
     attr->stacksize = stacksize;
     return 0;

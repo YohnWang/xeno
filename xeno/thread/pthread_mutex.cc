@@ -37,8 +37,8 @@ int pthread_mutexattr_gettype(const pthread_mutexattr_t *__attr, int *__kind)
 
 int pthread_mutexattr_settype(pthread_mutexattr_t *__attr, int __kind)
 {
-    if (__kind != PTHREAD_MUTEX_RECURSIVE || __kind != PTHREAD_MUTEX_NORMAL)
-        return -1;
+    if (__kind != PTHREAD_MUTEX_RECURSIVE && __kind != PTHREAD_MUTEX_NORMAL)
+        return EINVAL;
     __attr->type = __kind;
     return 0;
 }
@@ -68,6 +68,7 @@ int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a)
     else
         m->type = PTHREAD_MUTEX_NORMAL;
     m->handle = nullptr;
+    m->owner = nullptr;
     pthread_mutex_try_init(m);
     return 0;
 }
@@ -86,15 +87,28 @@ int pthread_mutex_lock(pthread_mutex_t *m)
     return 0;
 }
 
-int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *ts)
+// abstime 以 __clockid 为基准：CLOCK_MONOTONIC 由 SysTick 提供，不受
+// clock_settime 校时影响；CLOCK_REALTIME 是 MONOTONIC + 一个会被校时改掉的偏移。
+// libstdc++ 的 std::timed_mutex/std::recursive_timed_mutex 的
+// try_lock_until(steady_clock 期限) 在定义了 _GLIBCXX_USE_PTHREAD_MUTEX_CLOCKLOCK
+// 之后走的就是 CLOCK_MONOTONIC 这条路（否则它退化成 system_clock +
+// pthread_mutex_timedlock，即下面的 CLOCK_REALTIME 路径）。
+int pthread_mutex_clocklock(pthread_mutex_t *__restrict m, clockid_t __clockid,
+                            const struct timespec *__restrict ts)
 {
+    if(__clockid != CLOCK_REALTIME && __clockid != CLOCK_MONOTONIC)
+        return EINVAL;
+
     if(ts == nullptr)
         return pthread_mutex_lock(m);
+
+    if(ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L)
+        return EINVAL;
 
     pthread_mutex_try_init(m);
 
     struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    clock_gettime(__clockid, &start);
     struct timespec diff = timespec_diff(&start, ts);
     int64_t ms = diff.tv_sec * 1000LL + diff.tv_nsec / 1000000LL;
     if (ms < 0)
@@ -108,6 +122,12 @@ int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *ts)
         return ETIMEDOUT;
     m->owner = xTaskGetCurrentTaskHandle();
     return 0;
+}
+
+// POSIX: abstime 以 CLOCK_REALTIME 为基准
+int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *ts)
+{
+    return pthread_mutex_clocklock(m, CLOCK_REALTIME, ts);
 }
 
 int pthread_mutex_unlock(pthread_mutex_t *m)
@@ -124,8 +144,14 @@ int pthread_mutex_unlock(pthread_mutex_t *m)
         r = xSemaphoreGiveRecursive(m->handle);
     else
         r = xSemaphoreGive(m->handle);
-    m->owner = xTaskGetCurrentTaskHandle();
+
+    if(r == pdTRUE)
+    {
+        m->owner = (uxSemaphoreGetCount(m->handle) == 0)
+                     ? xTaskGetCurrentTaskHandle() : nullptr;
+    }
     xTaskResumeAll();
+
     if (r == pdTRUE)
         return 0;
     return EPERM;

@@ -11,7 +11,18 @@ using namespace xeno;
 
 int sem_init(sem_t *__sem, int __pshared, unsigned int __value)
 {
+    if(__value > (unsigned int)SEM_VALUE_MAX)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
     __sem->handle = xSemaphoreCreateCounting(SEM_VALUE_MAX, __value);
+    if(__sem->handle == nullptr)
+    {
+        errno = ENOSPC;
+        return -1;
+    }
     return 0;
 }
 
@@ -28,15 +39,22 @@ int sem_wait(sem_t *__sem)
     return 0;
 }
 
-int sem_timedwait(sem_t *__restrict __sem, const struct timespec *__restrict __abstime)
+int sem_clockwait(sem_t *__restrict __sem, clockid_t __clockid,
+                  const struct timespec *__restrict __abstime)
 {
+    if(__clockid != CLOCK_REALTIME && __clockid != CLOCK_MONOTONIC)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
     if(__abstime->tv_nsec < 0 || __abstime->tv_nsec >= 1'000'000'000)
     {
         errno = EINVAL;
         return -1;
     }
     struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    clock_gettime(__clockid, &start);
     struct timespec diff = timespec_diff(&start, __abstime);
     int64_t ms = diff.tv_sec * 1000LL + diff.tv_nsec / 1000000LL;
     if (ms < 0)
@@ -46,6 +64,11 @@ int sem_timedwait(sem_t *__restrict __sem, const struct timespec *__restrict __a
         return 0;
     errno = ETIMEDOUT;
     return -1;
+}
+
+int sem_timedwait(sem_t *__restrict __sem, const struct timespec *__restrict __abstime)
+{
+    return sem_clockwait(__sem, CLOCK_REALTIME, __abstime);
 }
 
 /* Test whether SEM is posted.  */

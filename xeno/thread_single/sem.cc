@@ -20,6 +20,12 @@ int sem_timedwait(sem_t *__restrict __sem, const struct timespec *__restrict __a
     return -1;
 }
 
+int sem_clockwait(sem_t *__restrict __sem, clockid_t __clockid,
+                  const struct timespec *__restrict __abstime)
+{
+    return -1;
+}
+
 int sem_trywait(sem_t *__sem)
 {
     return -1;
