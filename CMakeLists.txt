@@ -11,8 +11,12 @@ set(CMAKE_CXX_STANDARD 26)
 add_compile_options(-mthumb -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard)
 add_link_options(-mthumb -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -Wl,--no-warn-rwx-segments)
 
+add_compile_options(-Wall -Wno-unused -Os -fdiagnostics-color)
 add_compile_options(-ftls-model=local-exec)
 add_link_options(-ftls-model=local-exec -nostartfiles)
+
+add_compile_options(-ffunction-sections -fdata-sections)
+add_link_options(-Wl,--gc-sections)
 
 project(xeno)
 enable_language(C CXX ASM)

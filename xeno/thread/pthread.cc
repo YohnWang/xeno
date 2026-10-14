@@ -330,6 +330,6 @@ void __start()
     vTaskStartScheduler();
 }
 
-extern void * _start() noexcept __attribute__((alias("__start")));
+extern void _start() __attribute__((alias("__start")));
 
 }

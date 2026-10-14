@@ -34,12 +34,13 @@ add_custom_command(TARGET main POST_BUILD
 target_link_options(main PRIVATE -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/main.map,--cref)
 
 add_custom_target(sim
-    COMMAND time qemu-system-arm 
+    COMMAND qemu-system-arm 
     -M mps2-an500
     -kernel $<TARGET_FILE:main>
     -semihosting-config enable=on,target=native,chardev=stdio 
     -chardev stdio,id=stdio,mux=on,signal=off 
     -serial null -icount shift=auto
+    -display none -monitor none
     -no-reboot
     COMMAND echo exit code: $$?
     DEPENDS main USES_TERMINAL

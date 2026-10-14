@@ -17,6 +17,6 @@ void __start()
     exit(main(argc, argv));
 }
 
-void * _start() noexcept __attribute__((alias("__start")));
+void _start() __attribute__((alias("__start")));
 
 }

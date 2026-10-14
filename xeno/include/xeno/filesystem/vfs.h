@@ -199,7 +199,7 @@ public:
 
     int deallocate(int fd)
     {
-        if(fd >= 0 && fd < v.size())
+        if(fd >= 0 && (size_t)fd < v.size())
         {
             v[fd] = nullptr;
             return 0;
@@ -210,7 +210,7 @@ public:
 
     ifile* operator[](int fd)
     {
-        if(fd >= 0 && fd < v.size())
+        if(fd >= 0 && (size_t)fd < v.size())
         {
             return v[fd];
         }
