@@ -20,6 +20,9 @@ static thread_local const char *next_thread_name = nullptr;
 extern "C"
 {
 
+// 定义在 pthread_key.cc
+void __pthread_key_destruct(TaskHandle_t handler);
+
 void set_next_thread_stack(void *ptr, size_t bytes)
 {
     next_thread_stack_ptr = ptr;
@@ -113,7 +116,14 @@ int pthread_create(pthread_t *thread,
     if(attr_ == nullptr)
     {
         pthread_attr_init(&attr);
-        if(next_thread_stack_size != 0)
+        // set_next_thread_stack() 给的是调用者的静态栈缓冲区，
+        // set_next_thread_stack_size() 只给尺寸（缓冲区还是内核分配）
+        if(next_thread_stack_ptr != nullptr)
+        {
+            attr.stackaddr = next_thread_stack_ptr;
+            attr.stacksize = next_thread_stack_size;
+        }
+        else if(next_thread_stack_size != 0)
             attr.stacksize = next_thread_stack_size;
         if(next_thread_priority != 0)
             attr.param.sched_priority = next_thread_priority;
@@ -153,15 +163,32 @@ int pthread_create(pthread_t *thread,
     }
     else
     {
-        if((size_t)attr.stacksize < configMINIMAL_STACK_SIZE + sizeof(StaticTask_t))
+        // 静态栈：从调用者的缓冲区里切出 TCB 和栈。
+        // 这里只需要做内核不管的那部分：
+        // - TCB 的地址：xTaskCreateStatic() 是直接把 pxTaskBuffer 当 TCB_t* 用的
+        //   （tasks.c 里 prvCreateStaticTask 只做 memset + 赋值），一个字都不对齐。
+        //   错位的 TCB 会直接把任务打死（实测 +1/+2 字节就卡住），所以按自己的
+        //   对齐要求往下取整。
+        // - 栈还剩多少：configMINIMAL_STACK_SIZE 的单位是字（StackType_t），不是字节。
+        // 栈顶的 8 字节对齐不用管，prvInitialiseNewTask() 会把
+        // &pxStack[depth-1] 向下取整到 portBYTE_ALIGNMENT（CM4F 是 8）。
+        uintptr_t base = (uintptr_t)attr.stackaddr;
+        uintptr_t end  = base + attr.stacksize;
+        uintptr_t tcb_addr   = (base + alignof(StaticTask_t) - 1) & ~(uintptr_t)(alignof(StaticTask_t) - 1);
+        uintptr_t stack_addr = tcb_addr + sizeof(StaticTask_t);
+
+        if(end <= stack_addr ||
+           end - stack_addr < (size_t)configMINIMAL_STACK_SIZE * sizeof(StackType_t))
             return EINVAL;
-        
-        // TODO 对齐处理
-        StaticTask_t *tcb = (StaticTask_t *)attr.stackaddr;
-        StackType_t *stack = reinterpret_cast<StackType_t *>(tcb + 1);
-        size_t size = attr.stacksize - sizeof(StaticTask_t);
-        handler = xTaskCreateStatic(freertos_task, name, (size)/sizeof(StackType_t),
+
+        StaticTask_t *tcb = (StaticTask_t *)tcb_addr;
+        StackType_t *stack = (StackType_t *)stack_addr;
+        handler = xTaskCreateStatic(freertos_task, name, (end - stack_addr)/sizeof(StackType_t),
                                             internal, attr.param.sched_priority, stack, tcb);
+        // 失败时返回 NULL：下面还要拿 handler 写 TLS 指针，不判空就是往一个
+        // 未初始化的句柄里写数据
+        if(handler == nullptr)
+            return EAGAIN;
     }
 
     vTaskSetThreadLocalStoragePointer(handler, 0, internal);
@@ -184,6 +211,13 @@ void pthread_exit(void *value_ptr)
     }
 
     internal->result = value_ptr;
+
+    // 线程退出清理必须在这里做，不能等 pthread_join() 里的 vTaskDelete()：
+    // std::promise::set_value_at_thread_exit、std::notify_all_at_thread_exit 和
+    // __cxa_thread_atexit（thread_local 析构）全挂在 pthread key 的析构函数上。
+    // 推迟到 join 才跑的话，任何"等这个线程退出、之后再 join"的代码都会死锁
+    // （主线程卡在 future::get()，而 join 还没被调用）。
+    __pthread_key_destruct(xTaskGetCurrentTaskHandle());
 
     if(internal->detachstate == PTHREAD_CREATE_JOINABLE)
     {
@@ -319,7 +353,14 @@ static void main_routine(void *args)
     __libc_init_array();
     static const char *argv[] = {"main", nullptr};
     int argc = sizeof(argv) - 1;
-    exit(main(argc, argv));
+    int ret = main(argc, argv);
+
+    // main 也是一条 FreeRTOS 任务，但退出走的是 exit()：不经过 vTaskDelete，
+    // traceENTER 钩子不会替它跑析构，得在这里自己来一次（和 pthread_exit 一样）。
+    // thread_local 的析构由 libstdc++ 挂在 key 上，同样吃这一下。
+    __pthread_key_destruct(xTaskGetCurrentTaskHandle());
+
+    exit(ret);
 }
 
 void __start()

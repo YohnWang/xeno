@@ -107,18 +107,18 @@ int __futex_wake_n(int *ptr, int value, int n)
     int counter = 0;
     for(auto i: waiting_semaphores)
     {
-        if(counter < n)
-        {
-            if(i.first == ptr)
-            {
-                xSemaphoreGive(i.second);
-                counter++;
-            }
-        }
-        else
-        {
+        if(counter >= n)
             break;
-        }
+
+        if(i.first != ptr)
+            continue;
+
+        // 只有真的给出去了才算一次唤醒：等待者被唤醒后还要跑起来才会把自己从
+        // waiting_semaphores 里摘掉，在那之前它那个（二进制）信号量仍然是满的，
+        // xSemaphoreGive 会返回 errQUEUE_FULL。要是把失败的这次也计数并 break，
+        // 连续两次 signal 就只会喂到同一个等待者，第二个永远收不到通知。
+        if(xSemaphoreGive(i.second) == pdTRUE)
+            counter++;
     }
 
     return counter;

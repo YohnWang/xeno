@@ -65,6 +65,13 @@ int pthread_getname_np(pthread_t thread, char name[], size_t size)
     return EPERM;
 }
 
+// xeno/include/pthread.h 声明了这些函数，单线程构建也得提供同名符号，
+// 否则调用方直接链接失败（thread 和 thread_single 的接口要一致）
+void set_next_thread_stack(void *ptr, size_t bytes)
+{
+
+}
+
 void set_next_thread_stack_size(size_t bytes)
 {
 

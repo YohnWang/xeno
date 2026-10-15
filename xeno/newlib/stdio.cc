@@ -5,7 +5,7 @@
 
 
 extern "C"
-int _isatty(struct _reent *, int fd)
+int _isatty(int fd)
 {
     if(fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO)
         return 1;
