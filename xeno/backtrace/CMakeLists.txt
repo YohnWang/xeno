@@ -4,6 +4,7 @@ target_include_directories(xeno_backtrace PUBLIC .)
 
 target_sources(xeno_backtrace
     PRIVATE
+        fault_entry.S
         fault_handler.cc
         print_stacktrace.cc
 )

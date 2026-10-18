@@ -22,7 +22,7 @@ add_subdirectory(xeno_port)
 
 add_executable(main main.cc)
 
-target_link_libraries(main PRIVATE device semihost  xeno $<LINK_LIBRARY:WHOLE_ARCHIVE,xeno_thread,xeno_port>)
+target_link_libraries(main PRIVATE device semihost  xeno $<LINK_LIBRARY:WHOLE_ARCHIVE,xeno_thread,xeno_port,xeno_backtrace>)
 
 add_custom_command(TARGET main POST_BUILD
     COMMAND size main -A
