@@ -15,16 +15,15 @@ static void put_char(char ch)
 
 extern "C" int __console_read(void *buf, size_t size)
 {
-    char *s = static_cast<char *>(buf);
-    size_t i;
-    for(i = 0; i < size; i++)
-    {
-        int c = get_char();
-        if(c == -1)
-            break;
-        s[i] = (char)c;
-    }
-    return i;
+    // SYS_READC 会一直阻塞到下一个字符到来，不能在这里循环读满 newlib
+    // 请求的整个缓冲区，否则单行输入要等缓冲区填满才会交给调用者。
+    if(size == 0)
+        return 0;
+    int c = get_char();
+    if(c == -1)
+        return 0;
+    *static_cast<char *>(buf) = (char)c;
+    return 1;
 }
 
 

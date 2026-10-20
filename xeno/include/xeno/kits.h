@@ -76,6 +76,22 @@ public:
     {
         return rear - front >= queue_size;
     }
+
+    size_t size() const
+    {
+        return rear - front;
+    }
+
+    // 按入队顺序访问，0 为最旧的元素
+    T &operator[](size_t i)
+    {
+        return a[(front + i) % N];
+    }
+
+    const T &operator[](size_t i) const
+    {
+        return a[(front + i) % N];
+    }
 };
 
 struct sched_suspend_guard
