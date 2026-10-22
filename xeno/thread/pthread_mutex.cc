@@ -61,8 +61,34 @@ static void pthread_mutex_try_init(pthread_mutex_t *m)
     }
 }
 
+static int pthread_mutex_lock_isr(pthread_mutex_t *m)
+{
+    if(m->handle == nullptr || m->type == PTHREAD_MUTEX_RECURSIVE)
+        return EPERM;
+
+    BaseType_t woken = pdFALSE;
+    if(xSemaphoreTakeFromISR(m->handle, &woken) != pdTRUE)
+        return EBUSY;
+    portYIELD_FROM_ISR(woken);
+    return 0;
+}
+
+static int pthread_mutex_unlock_isr(pthread_mutex_t *m)
+{
+    if(m->handle == nullptr || m->type == PTHREAD_MUTEX_RECURSIVE || m->owner != nullptr)
+        return EPERM;
+
+    BaseType_t woken = pdFALSE;
+    if(xSemaphoreGiveFromISR(m->handle, &woken) != pdTRUE)
+        return EPERM;
+    portYIELD_FROM_ISR(woken);
+    return 0;
+}
+
 int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a)
 {
+    if(__is_interrupted())
+        return EPERM;
     if(a != nullptr)
         m->type = a->type;
     else
@@ -75,6 +101,8 @@ int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *a)
 
 int pthread_mutex_lock(pthread_mutex_t *m)
 {
+    if(__is_interrupted())
+        return pthread_mutex_lock_isr(m);
     pthread_mutex_try_init(m);
     BaseType_t r;
     if(m->type == PTHREAD_MUTEX_RECURSIVE)
@@ -99,11 +127,17 @@ int pthread_mutex_clocklock(pthread_mutex_t *__restrict m, clockid_t __clockid,
     if(__clockid != CLOCK_REALTIME && __clockid != CLOCK_MONOTONIC)
         return EINVAL;
 
+    if(ts != nullptr && (ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L))
+        return EINVAL;
+
+    if(__is_interrupted())
+    {
+        int e = pthread_mutex_lock_isr(m);
+        return e == EBUSY ? ETIMEDOUT : e;
+    }
+
     if(ts == nullptr)
         return pthread_mutex_lock(m);
-
-    if(ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000L)
-        return EINVAL;
 
     pthread_mutex_try_init(m);
 
@@ -132,6 +166,8 @@ int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *ts)
 
 int pthread_mutex_unlock(pthread_mutex_t *m)
 {
+    if(__is_interrupted())
+        return pthread_mutex_unlock_isr(m);
     pthread_mutex_try_init(m);
     if(m->owner != xTaskGetCurrentTaskHandle())
     {
@@ -171,6 +207,8 @@ int pthread_mutex_trylock(pthread_mutex_t *m)
 
 int pthread_mutex_destroy(pthread_mutex_t *m)
 {
+    if(__is_interrupted())
+        return EPERM;
     if(m->handle == nullptr)
         return 0;
     portENTER_CRITICAL();

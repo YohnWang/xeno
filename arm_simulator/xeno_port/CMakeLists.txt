@@ -6,4 +6,5 @@ target_sources(xeno_port
         stdio.cc
         exit.cc
         time.cc
+        machine.cc
 )

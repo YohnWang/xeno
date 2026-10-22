@@ -13,6 +13,7 @@ int __console_write(const void *buf, size_t size);
 // machine
 bool __irq_disable();
 void __irq_enable();
+bool __is_interrupted();
 
 // os
 bool __scheduler_suspend();

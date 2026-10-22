@@ -9,8 +9,23 @@
 
 using namespace xeno;
 
+static bool sem_take_isr(SemaphoreHandle_t h)
+{
+    BaseType_t woken = pdFALSE;
+    if(xSemaphoreTakeFromISR(h, &woken) != pdTRUE)
+        return false;
+    portYIELD_FROM_ISR(woken);
+    return true;
+}
+
 int sem_init(sem_t *__sem, int __pshared, unsigned int __value)
 {
+    if(__is_interrupted())
+    {
+        errno = EPERM;
+        return -1;
+    }
+
     if(__value > (unsigned int)SEM_VALUE_MAX)
     {
         errno = EINVAL;
@@ -28,6 +43,11 @@ int sem_init(sem_t *__sem, int __pshared, unsigned int __value)
 
 int sem_destroy(sem_t *__sem)
 {
+    if(__is_interrupted())
+    {
+        errno = EPERM;
+        return -1;
+    }
     vSemaphoreDelete(__sem->handle);
     __sem->handle = 0;
     return 0;
@@ -35,6 +55,13 @@ int sem_destroy(sem_t *__sem)
 
 int sem_wait(sem_t *__sem)
 {
+    if(__is_interrupted())
+    {
+        if(sem_take_isr(__sem->handle))
+            return 0;
+        errno = EAGAIN;
+        return -1;
+    }
     xSemaphoreTake(__sem->handle, portMAX_DELAY);
     return 0;
 }
@@ -53,6 +80,15 @@ int sem_clockwait(sem_t *__restrict __sem, clockid_t __clockid,
         errno = EINVAL;
         return -1;
     }
+
+    if(__is_interrupted())
+    {
+        if(sem_take_isr(__sem->handle))
+            return 0;
+        errno = ETIMEDOUT;
+        return -1;
+    }
+
     struct timespec start;
     clock_gettime(__clockid, &start);
     struct timespec diff = timespec_diff(&start, __abstime);
@@ -74,6 +110,14 @@ int sem_timedwait(sem_t *__restrict __sem, const struct timespec *__restrict __a
 /* Test whether SEM is posted.  */
 int sem_trywait(sem_t *__sem)
 {
+    if(__is_interrupted())
+    {
+        if(sem_take_isr(__sem->handle))
+            return 0;
+        errno = EAGAIN;
+        return -1;
+    }
+
     BaseType_t r = xSemaphoreTake(__sem->handle, 0);
     if(r == pdTRUE)
         return 0;
@@ -84,6 +128,18 @@ int sem_trywait(sem_t *__sem)
 /* Post SEM.  */
 int sem_post(sem_t *__sem)
 {
+    if(__is_interrupted())
+    {
+        BaseType_t woken = pdFALSE;
+        if(xSemaphoreGiveFromISR(__sem->handle, &woken) != pdTRUE)
+        {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        portYIELD_FROM_ISR(woken);
+        return 0;
+    }
+
     BaseType_t r = xSemaphoreGive(__sem->handle);
     if(r == pdTRUE)
         return 0;
@@ -93,7 +149,9 @@ int sem_post(sem_t *__sem)
 
 int sem_getvalue(sem_t *__restrict __sem, int *__restrict __sval)
 {
-    UBaseType_t v = uxSemaphoreGetCount(__sem->handle);
+    UBaseType_t v = __is_interrupted()
+                  ? uxSemaphoreGetCountFromISR(__sem->handle)
+                  : uxSemaphoreGetCount(__sem->handle);
     *__sval = v;
     return 0;
 }
