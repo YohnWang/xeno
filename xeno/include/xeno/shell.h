@@ -399,6 +399,16 @@ struct shell
         return it->second.function((int)args.size(), args.data());
     }
 
+    int system(std::string_view cmd)
+    {
+        return execute(cmd);
+    }
+
+    int system(const char *cmd)
+    {
+        return system(std::string_view(cmd));
+    }
+
     // 控制整体shell命令是否可见可执行，shell构造时默认为可以
     void authorize(bool enable = true)
     {
@@ -461,6 +471,16 @@ inline void shell_authorize(std::string_view cmd, bool enable = true)
 inline void shell_authorize(const char *cmd, bool enable = true)
 {
     shell_authorize(std::string_view(cmd), enable);
+}
+
+inline int shell_system(std::string_view cmd)
+{
+    return __shell().system(cmd);
+}
+
+inline int shell_system(const char *cmd)
+{
+    return shell_system(std::string_view(cmd));
 }
 
 inline void shell_start()
