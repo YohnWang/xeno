@@ -29,6 +29,7 @@ struct basic_terminal
     int char_index_next = 0;
     completer_t completer;
     std::string_view prompt; // 列出候选后重绘命令行时使用，可为空
+    bool echo_enabled = true; // 关闭时行编辑照常更新缓冲区，但不回显
 
     static constexpr size_t history_max = HistoryMax;
     xeno::static_queue<std::string, HistoryMax> history; // 0 为最旧，末尾为最新
@@ -36,9 +37,32 @@ struct basic_terminal
     std::string pending;    // 浏览历史前正在编辑的行，向下翻回时恢复
     int arrow_key_state = 0;
 
+    // 临时关闭/打开回显，用于密码等敏感输入。
+    void echo(bool enable = true)
+    {
+        echo_enabled = enable;
+    }
+
+    // 复位行编辑状态与回显，历史记录保留。
+    void reset()
+    {
+        order.clear();
+        buf.clear();
+        char_index_next = 0;
+        history_index = -1;
+        pending.clear();
+        arrow_key_state = 0;
+        echo_enabled = true;
+    }
+
     void push(int ch)
     {
         buf.insert(std::next(buf.begin(), char_index_next), ch);
+        if(!echo_enabled)
+        {
+            char_index_next++;
+            return;
+        }
         for(size_t i = char_index_next; i < buf.size(); i++)
             putchar(buf[i]);
         for(size_t i = buf.size() - 1; i > (size_t)char_index_next; i--)
@@ -51,15 +75,19 @@ struct basic_terminal
     {
         if(char_index_next > 0)
         {
-            putchar('\b');
-            for(size_t i = char_index_next; i < buf.size(); i++)
-                putchar(buf[i]);
-            putchar(' ');
-            for(int i = (int)buf.size(); i >= char_index_next; i--)
+            if(echo_enabled)
+            {
                 putchar('\b');
+                for(size_t i = char_index_next; i < buf.size(); i++)
+                    putchar(buf[i]);
+                putchar(' ');
+                for(int i = (int)buf.size(); i >= char_index_next; i--)
+                    putchar('\b');
+            }
             buf.erase(std::next(buf.begin(), char_index_next - 1));
             char_index_next--;
-            fflush(stdout);
+            if(echo_enabled)
+                fflush(stdout);
         }
     }
 
@@ -67,9 +95,12 @@ struct basic_terminal
     {
         if(char_index_next > 0)
         {
-            putchar('\b');
             char_index_next--;
-            fflush(stdout);
+            if(echo_enabled)
+            {
+                putchar('\b');
+                fflush(stdout);
+            }
         }
     }
 
@@ -77,9 +108,12 @@ struct basic_terminal
     {
         if(char_index_next < (int)buf.size())
         {
-            putchar(buf[char_index_next]);
+            if(echo_enabled)
+            {
+                putchar(buf[char_index_next]);
+                fflush(stdout);
+            }
             char_index_next++;
-            fflush(stdout);
         }
     }
 
@@ -94,14 +128,17 @@ struct basic_terminal
     {
         if(buf.empty())
             return;
-        for(int i = 0; i < char_index_next; i++)
-            putchar('\b');
-        for(size_t i = 0; i < buf.size(); i++)
-            putchar(' ');
-        for(size_t i = 0; i < buf.size(); i++)
-            putchar('\b');
+        if(echo_enabled)
+        {
+            for(int i = 0; i < char_index_next; i++)
+                putchar('\b');
+            for(size_t i = 0; i < buf.size(); i++)
+                putchar(' ');
+            for(size_t i = 0; i < buf.size(); i++)
+                putchar('\b');
+            fflush(stdout);
+        }
         char_index_next = 0;
-        fflush(stdout);
     }
 
     void show_line(std::string_view s)
@@ -109,6 +146,8 @@ struct basic_terminal
         clear_bufview();
         buf.assign(s);
         char_index_next = buf.size();
+        if(!echo_enabled)
+            return;
         for(auto i: buf)
             putchar(i);
         fflush(stdout);
@@ -116,7 +155,7 @@ struct basic_terminal
 
     void history_up()
     {
-        if(history.size() == 0)
+        if(!echo_enabled || history.size() == 0)
             return;
 
         if(history_index < 0)
@@ -138,7 +177,7 @@ struct basic_terminal
 
     void history_down()
     {
-        if(history_index < 0)
+        if(!echo_enabled || history_index < 0)
             return;
 
         history_index--;
@@ -188,7 +227,7 @@ struct basic_terminal
     // 补全光标所在的命令词。多个候选时补到公共前缀并列出全部候选。
     void complete()
     {
-        if(!completer || char_index_next <= 0)
+        if(!completer || char_index_next <= 0 || !echo_enabled)
             return;
 
         // 跳过行首空白，只补全第一个命令词
@@ -440,6 +479,19 @@ inline auto& __shell()
     return sh;
 }
 
+// 默认 shell 使用的终端。命令可通过 shell_echo() 控制其回显。
+inline terminal& __terminal()
+{
+    static terminal term;
+    return term;
+}
+
+// 临时关闭/打开默认 shell 的回显，用于密码等敏感输入。
+inline void shell_echo(bool enable = true)
+{
+    __terminal().echo(enable);
+}
+
 // 默认 shell 的运行状态。exit 命令会一直留在命令表里，状态必须放在静态区。
 inline std::atomic<bool>& __shell_running()
 {
@@ -490,7 +542,8 @@ inline void shell_start()
 
     std::jthread th{[](){
         shell &sh = __shell();
-        terminal term;
+        terminal &term = __terminal();
+        term.reset();
         term.prompt = "# ";
         sh.bind(term);
 
