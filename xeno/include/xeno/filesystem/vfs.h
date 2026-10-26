@@ -259,12 +259,13 @@ class vfs final
 {
     friend class ifs;
     std::flat_map<path, ifs*> mountpoints;
+    std::mutex mount_mutex;
     ofd fdmap;
-    std::recursive_mutex mutex;
+    std::mutex fd_mutex;
 
     std::tuple<ifs*, std::string> get_ifs_and_prefix(path p)
     {
-        std::lock_guard _{mutex};
+        std::lock_guard _{mount_mutex};
         std::string_view path_str = p;
         std::string_view prefix = {};
         ifs *fs = nullptr;
@@ -294,42 +295,32 @@ class vfs final
 
     auto get_ifile(int fd)
     {
-        std::lock_guard _{mutex};
+        std::lock_guard _{fd_mutex};
         return fdmap[fd];
     }
 public:
 
-    std::string get_mountpoint(ifs *fs)
-    {
-        for(auto [mp, ifs]: mountpoints)
-        {
-            if(ifs == fs)
-                return mp;
-        }
-        return "";
-    }
-
     int fd_alloc(ifile *file)
     {
-        std::lock_guard _{mutex};
+        std::lock_guard _{fd_mutex};
         return fdmap.allocate(file);
     }
 
     int fd_alloc(ifile *file, int fd)
     {
-        std::lock_guard _{mutex};
+        std::lock_guard _{fd_mutex};
         return fdmap.allocate(file, fd);
     }
 
     int fd_dealloc(int fd)
     {
-        std::lock_guard _{mutex};
+        std::lock_guard _{fd_mutex};
         return fdmap.deallocate(fd);
     }
 
     int mount(ifs &f, path dir)
     {
-        std::lock_guard _{mutex};
+        std::lock_guard _{mount_mutex};
         if(mountpoints.contains(dir))
         {
             errno = EBUSY;
@@ -342,7 +333,7 @@ public:
 
     int umount(path dir)
     {
-        std::lock_guard _{mutex};
+        std::lock_guard _{mount_mutex};
         if(mountpoints.contains(dir))
         {
             mountpoints.erase(dir);
