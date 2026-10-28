@@ -8,6 +8,7 @@ extern "C"{
 
 // io
 int __console_read(void *buf, size_t size);
+int __console_try_read(void *buf, size_t size);
 int __console_write(const void *buf, size_t size);
 
 // machine

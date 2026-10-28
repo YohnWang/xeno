@@ -7,6 +7,12 @@ extern "C" [[gnu::weak]] int __console_read(void *buf, size_t size)
     return -1;
 }
 
+extern "C" [[gnu::weak]] int __console_try_read(void *buf, size_t size)
+{
+    errno = EIO;
+    return -1;
+}
+
 extern "C" [[gnu::weak]] int __console_write(const void *buf, size_t size)
 {
     errno = EIO;
