@@ -21,6 +21,7 @@ add_subdirectory(filesystem)
 add_subdirectory(newlib)
 add_subdirectory(thread)
 add_subdirectory(thread_single)
+add_subdirectory(toolkit)
 
 add_library(xeno INTERFACE)
 target_link_libraries(xeno INTERFACE xeno_headers $<LINK_LIBRARY:WHOLE_ARCHIVE,xeno_filesystem,xeno_newlib,xeno_c++>)

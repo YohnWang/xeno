@@ -1,0 +1,3 @@
+add_library(xeno_toolkit INTERFACE)
+
+target_include_directories(xeno_toolkit INTERFACE include)
