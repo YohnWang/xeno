@@ -2,12 +2,14 @@
 
 #include<algorithm>
 #include<array>
+#include<concepts>
 #include<cstddef>
 #include<cstdint>
 #include<exception>
 #include<limits>
 #include<span>
 #include<string>
+#include<type_traits>
 
 namespace xeno
 {
@@ -15,11 +17,13 @@ namespace xeno
 // YMODEM-1K 接收端（单文件）。
 //
 // IO 由派生类提供：
-//   int  try_getchar(); // 非阻塞，返回 0..255，负数表示暂无数据
+//   int  try_getchar(); // 必须返回 int；0..255 为数据，负数表示暂无数据
+//                       // 从 char/int8_t 取字节时先转 unsigned char，
+//                       // 否则 0x80..0xFF 会被符号扩展成负数。
 //   void putchar(int);  // 发送单字节
 // 通过 deducing this + 继承在编译期绑定，不检查返回值以外的 IO 状态。
 // 超时与重发 'C' 由调用方计时，类内不做等待。
-class ymodem
+class ymodem_receiver
 {
 public:
     static constexpr std::size_t kUnknown = std::numeric_limits<std::size_t>::max();
@@ -65,24 +69,15 @@ public:
     // true 表示连接成功；false 表示继续轮询（已发 'C' 或 Block 0 未收完）。
     bool start_link(this auto &&self)
     {
-        auto get = [&]() -> int
-        {
-            return self.try_getchar();
-        };
-        auto put = [&](std::uint8_t c)
-        {
-            self.putchar(c);
-        };
-
         switch(self.ph_)
         {
         case phase::idle:
-            put(CRC_REQ);
+            self.put_byte(CRC_REQ);
             self.ph_ = phase::wait_block0;
             self.reset_frame();
             return false;
         case phase::wait_block0:
-            return self.drive_block0(get, put);
+            return self.drive_block0();
         case phase::data_phase:
         case phase::awaiting_eot:
             return true;
@@ -98,15 +93,6 @@ public:
     // 远端中止抛 cancelled，提前收到 EOT 抛 failed。
     std::size_t receive(this auto &&self, auto &&f)
     {
-        auto get = [&]() -> int
-        {
-            return self.try_getchar();
-        };
-        auto put = [&](std::uint8_t c)
-        {
-            self.putchar(c);
-        };
-
         if(self.ph_ == phase::idle)
         {
             (void)self.start_link();
@@ -114,14 +100,14 @@ public:
         }
         if(self.ph_ == phase::wait_block0)
         {
-            (void)self.drive_block0(get, put);
+            (void)self.drive_block0();
             return kUnknown;
         }
         self.throw_if_ended();
         if(self.ph_ == phase::finished)
             return 0;
 
-        auto r = self.read_frame(get, put);
+        auto r = self.read_frame();
         switch(r)
         {
         case read_result::pending:
@@ -129,12 +115,12 @@ public:
         case read_result::duplicate:
             return kUnknown;
         case read_result::cancelled:
-            send_cancel(put);
+            self.send_cancel();
             self.ph_ = phase::finished;
             self.end_ = end_state::cancelled;
             throw cancelled{};
         case read_result::eot:
-            put(ACK);
+            self.put_byte(ACK);
             self.ph_ = phase::finished;
             if(self.filesize_ != kUnknown && self.received_ < self.filesize_)
             {
@@ -147,7 +133,7 @@ public:
         }
 
         std::size_t data_len = self.body_len_ - CRC_SIZE;
-        std::span<std::byte> payload{self.body_.data(), data_len};
+        std::span<const std::byte> payload{self.body_.data(), data_len};
         std::size_t deliver = payload.size();
         if(self.filesize_ != kUnknown)
             deliver = std::min(deliver, self.filesize_ - self.received_);
@@ -156,12 +142,12 @@ public:
         // 发送方会重发该帧。
         self.reset_frame();
         if(deliver != 0)
-            f(payload.first(deliver));
+            self.deliver_bytes(f, payload.data(), deliver);
         if(self.filesize_ != kUnknown)
             self.received_ += deliver;
         self.data_started_ = true;
         self.expected_seq_ = static_cast<std::uint8_t>(self.expected_seq_ + 1);
-        put(ACK);
+        self.put_byte(ACK);
 
         if(self.filesize_ != kUnknown && self.received_ >= self.filesize_)
         {
@@ -183,27 +169,18 @@ public:
             return false;
         self.throw_if_ended();
 
-        auto get = [&]() -> int
-        {
-            return self.try_getchar();
-        };
-        auto put = [&](std::uint8_t c)
-        {
-            self.putchar(c);
-        };
-
         if(self.batch_ == batch_state::done)
             return true;
         if(self.batch_ == batch_state::none)
         {
-            put(CRC_REQ);
+            self.put_byte(CRC_REQ);
             self.batch_ = batch_state::waiting;
             self.expected_seq_ = 0;
             self.reset_frame();
             return false;
         }
 
-        auto r = self.read_frame(get, put);
+        auto r = self.read_frame();
         switch(r)
         {
         case read_result::pending:
@@ -211,13 +188,13 @@ public:
         case read_result::duplicate:
             return false;
         case read_result::cancelled:
-            send_cancel(put);
+            self.send_cancel();
             self.end_ = end_state::cancelled;
             throw cancelled{};
         case read_result::eot:
             // EOT ACK 丢失后发送方重发 EOT：再 ACK 并补发 'C'。
-            put(ACK);
-            put(CRC_REQ);
+            self.put_byte(ACK);
+            self.put_byte(CRC_REQ);
             return false;
         case read_result::ok:
             break;
@@ -229,13 +206,13 @@ public:
         self.reset_frame();
         if(empty_header)
         {
-            put(ACK);
+            self.put_byte(ACK);
             self.batch_ = batch_state::done;
             return true;
         }
 
         // 单文件接收端不能再收下一个文件，中止整个批处理。
-        send_cancel(put);
+        self.send_cancel();
         self.end_ = end_state::failed;
         throw failed{};
     }
@@ -246,14 +223,10 @@ public:
     {
         if(self.ph_ == phase::idle || self.ph_ == phase::finished)
             return;
-        auto put = [&](std::uint8_t c)
-        {
-            self.putchar(c);
-        };
         self.ph_ = phase::finished;
         self.end_ = end_state::cancelled;
         self.reset_frame();
-        send_cancel(put);
+        self.send_cancel();
         throw cancelled{};
     }
 
@@ -327,6 +300,45 @@ private:
     std::size_t body_pos_ = 0;
     std::size_t body_len_ = 0;
 
+    int get_byte(this auto &&self)
+    {
+        static_assert(std::is_same_v<decltype(self.try_getchar()), int>,
+                      "try_getchar() must return int; char/int8_t sign-extends bytes 0x80..0xFF");
+        return self.try_getchar();
+    }
+
+    void put_byte(this auto &&self, std::uint8_t c)
+    {
+        self.putchar(c);
+    }
+
+    template<typename F>
+    static void deliver_bytes(F &&f, const std::byte *data, std::size_t size)
+    {
+        if constexpr(std::invocable<F &, std::span<const std::byte>>)
+            f(std::span<const std::byte>{data, size});
+        else if constexpr(std::invocable<F &, const std::byte *, std::size_t>)
+            f(data, size);
+        else if constexpr(std::invocable<F &, std::span<const std::uint8_t>>)
+            f(std::span<const std::uint8_t>{
+                reinterpret_cast<const std::uint8_t *>(data), size});
+        else if constexpr(std::invocable<F &, const std::uint8_t *, std::size_t>)
+            f(reinterpret_cast<const std::uint8_t *>(data), size);
+        else if constexpr(std::invocable<F &, std::span<const char>>)
+            f(std::span<const char>{reinterpret_cast<const char *>(data), size});
+        else if constexpr(std::invocable<F &, const char *, std::size_t>)
+            f(reinterpret_cast<const char *>(data), size);
+        else if constexpr(std::invocable<F &, std::span<const std::int8_t>>)
+            f(std::span<const std::int8_t>{
+                reinterpret_cast<const std::int8_t *>(data), size});
+        else if constexpr(std::invocable<F &, const std::int8_t *, std::size_t>)
+            f(reinterpret_cast<const std::int8_t *>(data), size);
+        else
+            static_assert(std::invocable<F &, std::span<const std::byte>>,
+                          "receive callback must accept std::span<const T> "
+                          "or (const T *, std::size_t)");
+    }
+
     void reset_frame()
     {
         hdr_pos_ = body_pos_ = body_len_ = 0;
@@ -340,10 +352,10 @@ private:
             throw failed{};
     }
 
-    static void send_cancel(auto &&put)
+    void send_cancel(this auto &&self)
     {
         for(int i = 0; i < CAN_BURST; ++i)
-            put(CAN);
+            self.put_byte(CAN);
     }
 
     static std::uint16_t crc16(std::span<const std::byte> data)
@@ -393,83 +405,83 @@ private:
             filesize_ = v;
     }
 
-    read_result read_frame(auto &&get, auto &&put)
+    read_result read_frame(this auto &&self)
     {
-        while(hdr_pos_ < HDR_SIZE)
+        while(self.hdr_pos_ < HDR_SIZE)
         {
-            int c = get();
+            int c = self.get_byte();
             if(c < 0)
                 return read_result::pending;
-            hdr_[hdr_pos_++] = static_cast<std::uint8_t>(c);
+            self.hdr_[self.hdr_pos_++] = static_cast<std::uint8_t>(c);
 
             // EOT/CAN 是单字节信号，必须在帧头首字节立即判断。
             // 数据段里的 0x18/0x03 是合法数据，只有这里检测。
-            if(hdr_pos_ == 1)
+            if(self.hdr_pos_ == 1)
             {
-                switch(hdr_[0])
+                switch(self.hdr_[0])
                 {
                 case EOT:
-                    reset_frame();
+                    self.reset_frame();
                     return read_result::eot;
                 case CAN:
                 case CTRL_C:
-                    reset_frame();
+                    self.reset_frame();
                     return read_result::cancelled;
                 case SOH:
-                    body_len_ = PKT_128 + CRC_SIZE;
+                    self.body_len_ = PKT_128 + CRC_SIZE;
                     break;
                 case STX:
-                    body_len_ = PKT_1K + CRC_SIZE;
+                    self.body_len_ = PKT_1K + CRC_SIZE;
                     break;
                 default:
-                    put(NAK);
-                    reset_frame();
+                    self.put_byte(NAK);
+                    self.reset_frame();
                     return read_result::error;
                 }
             }
         }
 
-        while(body_pos_ < body_len_)
+        while(self.body_pos_ < self.body_len_)
         {
-            int c = get();
+            int c = self.get_byte();
             if(c < 0)
                 return read_result::pending;
-            body_[body_pos_++] = static_cast<std::byte>(c);
+            self.body_[self.body_pos_++] = static_cast<std::byte>(c);
         }
 
-        std::size_t data_len = body_len_ - CRC_SIZE;
-        std::span<const std::byte> payload{body_.data(), data_len};
+        std::size_t data_len = self.body_len_ - CRC_SIZE;
+        std::span<const std::byte> payload{self.body_.data(), data_len};
         std::uint16_t recv_crc =
-            (static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(body_[data_len])) << 8) |
-            std::to_integer<std::uint8_t>(body_[data_len + 1]);
+            (static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(self.body_[data_len])) << 8) |
+            std::to_integer<std::uint8_t>(self.body_[data_len + 1]);
 
-        std::uint8_t seq = hdr_[1], nseq = hdr_[2];
-        if(crc16(payload) != recv_crc || nseq != static_cast<std::uint8_t>(~seq))
+        std::uint8_t seq = self.hdr_[1], nseq = self.hdr_[2];
+        if(self.crc16(payload) != recv_crc || nseq != static_cast<std::uint8_t>(~seq))
         {
-            put(NAK);
-            reset_frame();
+            self.put_byte(NAK);
+            self.reset_frame();
             return read_result::error;
         }
-        if(seq == expected_seq_)
+        if(seq == self.expected_seq_)
             return read_result::ok;
-        if(ph_ != phase::wait_block0 &&
-           seq == static_cast<std::uint8_t>(expected_seq_ - 1))
+        if(self.ph_ != phase::wait_block0 &&
+           seq == static_cast<std::uint8_t>(self.expected_seq_ - 1))
         {
-            put(ACK);
+            self.put_byte(ACK);
             // Block 0 重传：发送方还在等 'C'，补发一次。
-            if(seq == 0 && !data_started_)
-                put(CRC_REQ);
-            reset_frame();
+            if(seq == 0 && !self.data_started_)
+                self.put_byte(CRC_REQ);
+            self.reset_frame();
             return read_result::duplicate;
         }
-        put(NAK);
-        reset_frame();
+        self.put_byte(NAK);
+        self.reset_frame();
         return read_result::error;
     }
 
-    bool drive_block0(auto &&get, auto &&put)
+    bool drive_block0(this auto &&self)
     {
-        auto r = read_frame(get, put);
+        auto r = self.read_frame();
         switch(r)
         {
         case read_result::pending:
@@ -477,37 +489,37 @@ private:
         case read_result::duplicate:
             return false;
         case read_result::cancelled:
-            send_cancel(put);
-            ph_ = phase::finished;
-            end_ = end_state::cancelled;
+            self.send_cancel();
+            self.ph_ = phase::finished;
+            self.end_ = end_state::cancelled;
             throw cancelled{};
         case read_result::eot:
-            put(ACK);
-            ph_ = phase::finished;
-            end_ = end_state::failed;
+            self.put_byte(ACK);
+            self.ph_ = phase::finished;
+            self.end_ = end_state::failed;
             throw failed{};
         case read_result::ok:
             break;
         }
 
-        std::size_t data_len = body_len_ - CRC_SIZE;
-        std::span<const std::byte> payload{body_.data(), data_len};
-        parse_block0(payload);
-        reset_frame();
+        std::size_t data_len = self.body_len_ - CRC_SIZE;
+        std::span<const std::byte> payload{self.body_.data(), data_len};
+        self.parse_block0(payload);
+        self.reset_frame();
 
-        if(filename_.empty())
+        if(self.filename_.empty())
         {
             // 空文件头是批处理的结束标记；单文件接收视为失败。
-            put(ACK);
-            ph_ = phase::finished;
-            end_ = end_state::failed;
+            self.put_byte(ACK);
+            self.ph_ = phase::finished;
+            self.end_ = end_state::failed;
             throw failed{};
         }
 
-        expected_seq_ = 1;
-        ph_ = phase::data_phase;
-        put(ACK);
-        put(CRC_REQ);
+        self.expected_seq_ = 1;
+        self.ph_ = phase::data_phase;
+        self.put_byte(ACK);
+        self.put_byte(CRC_REQ);
         return true;
     }
 };

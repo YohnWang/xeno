@@ -1,4 +1,4 @@
-# xeno::ymodem 使用说明
+# xeno::ymodem_receiver 使用说明
 
 单文件 YMODEM-1K 接收端，header-only，位于 `xeno/toolkit/include/xeno/ymodem.h`。
 支持 SOH(128B) / STX(1KB) 帧、CRC16/XMODEM、Block 0 文件名与大小解析。
@@ -8,12 +8,16 @@
 通过继承 + deducing this 在编译期绑定 IO，不需要虚函数或函数指针：
 
 ```cpp
-struct serial_io : xeno::ymodem
+struct serial_io : xeno::ymodem_receiver
 {
-    // 非阻塞：返回 0..255 表示一个字节，返回负数表示暂无数据。
+    // 必须返回 int：0..255 是数据，负数表示暂无数据。
+    // 不能声明为 char/int8_t，否则 0x80..0xFF 会被符号扩展成负数。
     int try_getchar()
     {
-        return uart_rx_ready() ? uart_read() : -1;
+        char c;
+        if(!uart_try_read(c))
+            return -1;
+        return static_cast<unsigned char>(c); // 关键：先转 unsigned char
     }
 
     // 发送一个字节。
@@ -24,20 +28,19 @@ struct serial_io : xeno::ymodem
 };
 ```
 
-`try_getchar()` 必须是单字节、非阻塞的。类内不做任何等待、超时或重发计时。
+`try_getchar()` 必须是单字节、非阻塞的，返回类型由类内 `static_assert` 强制为 `int`。
+类内不做任何等待、超时或重发计时。若底层缓冲区是 `char`/`int8_t`，返回前务必转
+`unsigned char`，否则 `0x80..0xFF` 会变成负数并被当作“暂无数据”。
 
 ## 公共接口
 
 ```cpp
 static constexpr std::size_t kUnknown;
 
-enum class connect { pending, ok };
-
 std::string filename() const;   // Block 0 解析成功后有效
 std::size_t filesize() const;   // kUnknown 表示发送方未提供大小
-bool        aborted()  const;   // 是否因取消而结束
 
-connect     start_link(this auto &&self);
+bool        start_link(this auto &&self);
 std::size_t receive(this auto &&self, auto &&f);
 bool        finish_batch(this auto &&self);
 void        cancel(this auto &&self);
@@ -50,27 +53,27 @@ void        reset();
 
 | 异常 | 触发条件 |
 |---|---|
-| `ymodem::cancelled` | 远端在帧头首字节发来 `CAN(0x18)` 或 `CTRL_C(0x03)`；`finish_batch()` 等待空 Block 0 时收到 CAN；或在中止后再次调用 `start_link()/receive()/finish_batch()` |
-| `ymodem::failed` | 握手阶段收到 EOT；收到空文件头（文件名为空）；已知文件大小但数据未收完就收到 EOT；`finish_batch()` 收到非空 Block 0（发送方还有下一个文件） |
+| `ymodem_receiver::cancelled` | 远端在帧头首字节发来 `CAN(0x18)` 或 `CTRL_C(0x03)`；`finish_batch()` 等待空 Block 0 时收到 CAN；或在中止后再次调用 `start_link()/receive()/finish_batch()` |
+| `ymodem_receiver::failed` | 握手阶段收到 EOT；收到空文件头（文件名为空）；已知文件大小但数据未收完就收到 EOT；`finish_batch()` 收到非空 Block 0（发送方还有下一个文件） |
 
-两者都继承 `ymodem::error`，而 `ymodem::error` 继承 `std::exception`。
+两者都继承 `ymodem_receiver::error`，而 `ymodem_receiver::error` 继承 `std::exception`。
 
 注意：
 
-- `cancel()` 是本地用户主动取消，本身**不抛异常**；它只发 CAN 并置为已中止。
-- `cancel()` 之后再调用 `start_link()/receive()` 会抛 `cancelled`。
+- `cancel()` 在 `idle/finished` 状态下是空操作；活动传输中取消会发 CAN、进入 `finished`，并抛 `cancelled`。
+- `cancel()` 之后再调用 `start_link()/receive()/finish_batch()` 会抛 `cancelled`。
 - 回调内部抛出的异常会原样传播，类不会把它转换成 `failed`。
 
 ### start_link()
 
 | 返回值 | 含义 |
 |---|---|
-| `pending` | 已发出 `'C'`，或 Block 0 尚未收完，继续轮询 |
-| `ok` | 连接成功；`filename()/filesize()` 可用 |
+| `true` | 连接成功；`filename()/filesize()` 可用 |
+| `false` | 已发出 `'C'`，或 Block 0 尚未收完，继续轮询 |
 
-- `phase` 处于 `data_phase / awaiting_eot` 时重复调用恒返回 `ok`。
-- 正常结束后重复调用返回 `ok`；异常结束后重复调用抛对应异常。
-- 握手超时由调用方处理：需要重发 `'C'` 时执行 `reset()` 再 `start_link()`。
+- `phase` 处于 `data_phase / awaiting_eot` 时重复调用恒返回 `true`。
+- 正常结束后重复调用返回 `true`；异常结束后重复调用抛对应异常。
+- 握手超时由调用方处理：需要重新发 `'C'` 时执行 `reset()` 再 `start_link()`。
 
 ### receive()
 
@@ -91,7 +94,7 @@ void        reset();
 bool finish_batch(this auto &&self);
 ```
 
-- 只在 `receive()` 返回 `0` 且 `aborted() == false` 后调用；其他阶段调用返回 `false`，不发任何字节。
+- 只在 `receive()` 返回 `0` 且未抛异常后调用；其他阶段调用返回 `false`，不发任何字节。
 - 非阻塞轮询：第一次调用发送 `'C'`，之后每次调用解析已到达的字节；收到空 Block 0 并回 ACK 后返回 `true`。
 - 完成后重复调用返回 `true`，不再发送字节。
 - 不修改 `filename()/filesize()`，已接收文件的信息仍可查询。
@@ -100,8 +103,8 @@ bool finish_batch(this auto &&self);
 
 ### cancel() / reset()
 
-- `cancel()`：`idle` 或 `finished` 状态下是空操作；其余状态发送 8 个 `0x18`，进入 `finished`，`aborted() == true`。
-- `reset()`：回到 `idle`，清空文件名、大小、已收字节数、中止标志和帧缓冲。用于同一会话中接收下一个文件，或中止后重新开始。
+- `cancel()`：`idle` 或 `finished` 状态下是空操作；其余状态发送 8 个 `0x18`，进入 `finished`，并抛 `cancelled`。
+- `reset()`：回到 `idle`，清空文件名、大小、已收字节数和帧缓冲。用于同一会话中接收下一个文件，或中止后重新开始。
 
 ## 典型流程
 
@@ -110,17 +113,14 @@ serial_io rx;
 
 try
 {
-    while(rx.start_link() == xeno::ymodem::connect::pending)
+    while(!rx.start_link())
     {
         if(user_pressed_ctrl_c())
-        {
-            rx.cancel();   // 本地取消，不抛异常
-            return;
-        }
+            rx.cancel();   // 活动传输中抛 cancelled，由外层统一处理
         // 在这里做 'C' 重发计时：超时后 rx.reset(); rx.start_link();
     }
 
-    while(rx.receive([&](std::span<std::byte> data) {
+    while(rx.receive([&](std::span<const std::byte> data) {
               file.write(reinterpret_cast<const char *>(data.data()), data.size());
           }) != 0)
     {
@@ -140,22 +140,30 @@ try
             break;
     }
 
-    if(rx.aborted())
-        discard(file);
-    else
-        commit(file);   // 正常结束
+    commit(file);   // 正常结束
 }
-catch(const xeno::ymodem::cancelled &)
+catch(const xeno::ymodem_receiver::cancelled &)
 {
     discard(file);
 }
-catch(const xeno::ymodem::failed &)
+catch(const xeno::ymodem_receiver::failed &)
 {
     discard(file);
 }
 ```
 
-回调拿到的 `data` 指向类内部缓冲区，**只在回调返回前有效**；需要留存必须拷贝。
+回调参数是**只读**数据，可声明为以下任意一种形式（span 或 C 式指针 + 长度），
+类会按回调可接受的形式交付：
+
+```cpp
+std::span<const std::byte>     /  (const std::byte *, std::size_t)
+std::span<const std::uint8_t>  /  (const std::uint8_t *, std::size_t)
+std::span<const char>          /  (const char *, std::size_t)
+std::span<const std::int8_t>   /  (const std::int8_t *, std::size_t)
+```
+
+可写版本（如 `std::span<std::byte>`、`std::byte *`）不接受，因为数据位于类内部
+缓冲区，回调返回后还会被复用。`data` **只在回调返回前有效**；需要留存必须拷贝。
 
 `finish_batch()` 是可选的：`receive()` 返回 0 时文件数据已经完整，即使 `finish_batch()` 抛异常，也可以由调用方决定是否保留文件。
 

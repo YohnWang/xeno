@@ -2,12 +2,14 @@
 
 #include<algorithm>
 #include<array>
+#include<concepts>
 #include<cstddef>
 #include<cstdint>
 #include<exception>
 #include<limits>
 #include<span>
 #include<string>
+#include<type_traits>
 
 namespace xeno
 {
@@ -15,13 +17,15 @@ namespace xeno
 // ZMODEM 接收端（单文件）。
 //
 // IO 由派生类提供：
-//   int  try_getchar(); // 非阻塞，返回 0..255，负数表示暂无数据
+//   int  try_getchar(); // 必须返回 int；0..255 为数据，负数表示暂无数据
+//                       // 从 char/int8_t 取字节时先转 unsigned char，
+//                       // 否则 0x80..0xFF 会被符号扩展成负数。
 //   void putchar(int);  // 发送单字节
 // 通过 deducing this + 继承在编译期绑定，不检查返回值以外的 IO 状态。
 // 超时与重试由调用方计时，类内不做等待。
 //
 // 所有文件内容都按原始二进制交付，不做 CR/LF 或字符集转换。
-class zmodem
+class zmodem_receiver
 {
 public:
     static constexpr std::size_t kUnknown = std::numeric_limits<std::size_t>::max();
@@ -31,10 +35,6 @@ public:
         // 从文件的这个偏移开始接收；0 表示从头重传。
         // 非 0 时只发 ZRPOS，不做 ZCRC 校验，调用方需保证已有前缀一致。
         std::size_t resume_offset = 0;
-
-        // ZRINIT 通告的接收缓冲大小 = window * 1024，限制在 1..8。
-        // ZMODEM 真正的发送窗口由发送端控制，这里只影响它可用的块大小。
-        std::size_t window = 1;
     };
 
     // 传输非正常结束。start_link()/receive()/finish_batch() 在终止状态下抛出。
@@ -78,21 +78,7 @@ public:
     // true 表示已收到 ZFILE 并发出 ZRPOS；false 表示继续轮询。
     bool start_link(this auto &&self, const options &opt = {})
     {
-        auto get = [&]() -> int
-        {
-            if(self.pushback_ >= 0)
-            {
-                int c = self.pushback_;
-                self.pushback_ = -1;
-                return c;
-            }
-            return self.try_getchar();
-        };
-        auto put = [&](std::uint8_t c)
-        {
-            self.putchar(c);
-        };
-        return self.start_link_impl(get, put, opt);
+        return self.start_link_impl(opt);
     }
 
     // ---- 接收当前文件 ----
@@ -100,21 +86,7 @@ public:
     // 其余为剩余待交付字节数（filesize 已知时）。
     std::size_t receive(this auto &&self, auto &&f)
     {
-        auto get = [&]() -> int
-        {
-            if(self.pushback_ >= 0)
-            {
-                int c = self.pushback_;
-                self.pushback_ = -1;
-                return c;
-            }
-            return self.try_getchar();
-        };
-        auto put = [&](std::uint8_t c)
-        {
-            self.putchar(c);
-        };
-        return self.receive_impl(get, put, f);
+        return self.receive_impl(f);
     }
 
     // ---- 结束 ZMODEM 批处理 ----
@@ -122,32 +94,14 @@ public:
     // 发 ZRINIT，后续文件用 ZSKIP 跳过，收到 ZFIN 并回 ZFIN 后返回 true。
     bool finish_batch(this auto &&self)
     {
-        auto get = [&]() -> int
-        {
-            if(self.pushback_ >= 0)
-            {
-                int c = self.pushback_;
-                self.pushback_ = -1;
-                return c;
-            }
-            return self.try_getchar();
-        };
-        auto put = [&](std::uint8_t c)
-        {
-            self.putchar(c);
-        };
-        return self.finish_batch_impl(get, put);
+        return self.finish_batch_impl();
     }
 
     // ---- 本地用户按 Ctrl+C 时调用：发 CAN 串并抛 cancelled ----
     // idle/done 状态下是空操作，不抛异常。
     void cancel(this auto &&self)
     {
-        auto put = [&](std::uint8_t c)
-        {
-            self.putchar(c);
-        };
-        self.cancel_impl(put);
+        self.cancel_impl();
     }
 
     void reset()
@@ -325,6 +279,51 @@ private:
     bool hex_lf_ = false;
     int pushback_ = -1;
 
+    int get_byte(this auto &&self)
+    {
+        static_assert(std::is_same_v<decltype(self.try_getchar()), int>,
+                      "try_getchar() must return int; char/int8_t sign-extends bytes 0x80..0xFF");
+        if(self.pushback_ >= 0)
+        {
+            int c = self.pushback_;
+            self.pushback_ = -1;
+            return c;
+        }
+        return self.try_getchar();
+    }
+
+    void put_byte(this auto &&self, std::uint8_t c)
+    {
+        self.putchar(c);
+    }
+
+    template<typename F>
+    static void deliver_bytes(F &&f, const std::byte *data, std::size_t size)
+    {
+        if constexpr(std::invocable<F &, std::span<const std::byte>>)
+            f(std::span<const std::byte>{data, size});
+        else if constexpr(std::invocable<F &, const std::byte *, std::size_t>)
+            f(data, size);
+        else if constexpr(std::invocable<F &, std::span<const std::uint8_t>>)
+            f(std::span<const std::uint8_t>{
+                reinterpret_cast<const std::uint8_t *>(data), size});
+        else if constexpr(std::invocable<F &, const std::uint8_t *, std::size_t>)
+            f(reinterpret_cast<const std::uint8_t *>(data), size);
+        else if constexpr(std::invocable<F &, std::span<const char>>)
+            f(std::span<const char>{reinterpret_cast<const char *>(data), size});
+        else if constexpr(std::invocable<F &, const char *, std::size_t>)
+            f(reinterpret_cast<const char *>(data), size);
+        else if constexpr(std::invocable<F &, std::span<const std::int8_t>>)
+            f(std::span<const std::int8_t>{
+                reinterpret_cast<const std::int8_t *>(data), size});
+        else if constexpr(std::invocable<F &, const std::int8_t *, std::size_t>)
+            f(reinterpret_cast<const std::int8_t *>(data), size);
+        else
+            static_assert(std::invocable<F &, std::span<const std::byte>>,
+                          "receive callback must accept std::span<const T> "
+                          "or (const T *, std::size_t)");
+    }
+
     void throw_if_ended() const
     {
         if(end_ == end_state::cancelled)
@@ -377,85 +376,85 @@ private:
         return -1;
     }
 
-    static void put_hex_digit(auto &&put, std::uint8_t v)
+    void put_hex_digit(this auto &&self, std::uint8_t v)
     {
         static constexpr char digits[] = "0123456789abcdef";
-        put(static_cast<std::uint8_t>(digits[(v >> 4) & 0x0F]));
-        put(static_cast<std::uint8_t>(digits[v & 0x0F]));
+        self.put_byte(static_cast<std::uint8_t>(digits[(v >> 4) & 0x0F]));
+        self.put_byte(static_cast<std::uint8_t>(digits[v & 0x0F]));
     }
 
     // 发送 hex 头。type + info 用 CRC16，格式与 lrzsz 的 zshhdr 一致。
-    static void send_hex_header(auto &&put, std::uint8_t type, const std::uint8_t info[4])
+    void send_hex_header(this auto &&self, std::uint8_t type, const std::uint8_t info[4])
     {
         std::uint16_t crc = 0;
-        put(ZPAD);
-        put(ZPAD);
-        put(ZDLE);
-        put(ZHEX);
+        self.put_byte(ZPAD);
+        self.put_byte(ZPAD);
+        self.put_byte(ZDLE);
+        self.put_byte(ZHEX);
 
         type &= 0x7F;
-        put_hex_digit(put, type);
+        self.put_hex_digit(type);
         crc = crc16_byte(crc, type);
         for(int i = 0; i < 4; ++i)
         {
-            put_hex_digit(put, info[i]);
+            self.put_hex_digit(info[i]);
             crc = crc16_byte(crc, info[i]);
         }
-        put_hex_digit(put, static_cast<std::uint8_t>(crc >> 8));
-        put_hex_digit(put, static_cast<std::uint8_t>(crc));
+        self.put_hex_digit(static_cast<std::uint8_t>(crc >> 8));
+        self.put_hex_digit(static_cast<std::uint8_t>(crc));
 
-        put('\r');
-        put('\n');
+        self.put_byte('\r');
+        self.put_byte('\n');
         if(type != ZFIN && type != ZACK)
-            put(XON);
+            self.put_byte(XON);
     }
 
-    static void send_position_header(auto &&put, std::uint8_t type, std::size_t pos)
+    void send_position_header(this auto &&self, std::uint8_t type, std::size_t pos)
     {
         std::uint8_t info[4]{};
         set_position(info, pos);
-        send_hex_header(put, type, info);
+        self.send_hex_header(type, info);
     }
 
-    void send_zrinit(auto &&put) const
+    void send_zrinit(this auto &&self)
     {
-        std::size_t blocks = opt_.window == 0 ? 1 : opt_.window;
-        blocks = std::min<std::size_t>(blocks, MAX_BLOCK / 1024);
-        std::uint16_t bufsize = static_cast<std::uint16_t>(blocks * 1024);
-
+        // ZP0/ZP1 = 0：按 ZMODEM 规范表示接收端允许连续 I/O（streaming），
+        // 与 lrzsz rz 发出的规范 ZRINIT 一致；终端（如 WindTerm）据此自动
+        // 发起文件选择。写非 0 会切换为分段传输，可能不被自动识别。
+        // 内部仍以 8KB 缓冲为硬上限，超长数据子包会触发 ZRPOS。
         std::uint8_t info[4]{};
-        info[ZP0] = static_cast<std::uint8_t>(bufsize);
-        info[ZP1] = static_cast<std::uint8_t>(bufsize >> 8);
+        info[ZP0] = 0;
+        info[ZP1] = 0;
         info[ZF1] = 0;
         info[ZF0] = CANFDX | CANOVIO | CANFC32 | ESCCTL;
-        send_hex_header(put, ZRINIT, info);
+        self.send_hex_header(ZRINIT, info);
     }
 
-    static void send_cancel(auto &&put)
+    void send_cancel(this auto &&self)
     {
         for(int i = 0; i < CAN_BURST; ++i)
-            put(CAN);
+            self.put_byte(CAN);
         for(int i = 0; i < CAN_BURST; ++i)
-            put(0x08);
+            self.put_byte(0x08);
     }
 
     // 读取一个经过 ZDLE 转义的逻辑字节。
-    byte_status read_escaped(auto &&get, std::uint8_t &out)
+    byte_status read_escaped(this auto &&self, std::uint8_t &out)
     {
         for(;;)
         {
-            int c = get();
+            int c = self.get_byte();
             if(c < 0)
                 return byte_status::pending;
             std::uint8_t b = static_cast<std::uint8_t>(c);
 
-            if(es_ == esc_state::normal)
+            if(self.es_ == esc_state::normal)
             {
                 if(b == XON || b == XOFF)
                     continue;
                 if(b == ZDLE)
                 {
-                    es_ = esc_state::after_zdle;
+                    self.es_ = esc_state::after_zdle;
                     continue;
                 }
                 out = b;
@@ -465,7 +464,7 @@ private:
             // after_zdle
             if(b == XON || b == XOFF)
                 continue; // 流控字符，ZDLE 仍在等待
-            es_ = esc_state::normal;
+            self.es_ = esc_state::normal;
             if(b == CAN)
                 return byte_status::cancelled;
             if(b == ZRUB0)
@@ -534,37 +533,37 @@ private:
         return hdr_status::ok;
     }
 
-    hdr_status poll_header(auto &&get, header &h)
+    hdr_status poll_header(this auto &&self, header &h)
     {
         for(;;)
         {
-            switch(hs_)
+            switch(self.hs_)
             {
             case hdr_state::search:
             {
-                int c = get();
+                int c = self.get_byte();
                 if(c < 0)
                     return hdr_status::pending;
                 std::uint8_t b = static_cast<std::uint8_t>(c);
                 if(b == CAN)
                 {
-                    if(++can_count_ >= 5)
+                    if(++self.can_count_ >= 5)
                         return hdr_status::cancelled;
                     continue;
                 }
-                can_count_ = 0;
+                self.can_count_ = 0;
                 if(b == XON || b == XOFF)
                     continue;
                 if(b == ZPAD || b == static_cast<std::uint8_t>(ZPAD | 0x80))
                 {
-                    hs_ = hdr_state::pad;
+                    self.hs_ = hdr_state::pad;
                     continue;
                 }
                 continue;
             }
             case hdr_state::pad:
             {
-                int c = get();
+                int c = self.get_byte();
                 if(c < 0)
                     return hdr_status::pending;
                 std::uint8_t b = static_cast<std::uint8_t>(c);
@@ -576,126 +575,126 @@ private:
                 // 但 ZPAD 之后的 0x18 是帧头引导符，不是取消。
                 if(b == ZDLE)
                 {
-                    can_count_ = 0;
-                    hs_ = hdr_state::kind;
+                    self.can_count_ = 0;
+                    self.hs_ = hdr_state::kind;
                     continue;
                 }
-                hs_ = hdr_state::search;
+                self.hs_ = hdr_state::search;
                 continue;
             }
             case hdr_state::kind:
             {
-                int c = get();
+                int c = self.get_byte();
                 if(c < 0)
                     return hdr_status::pending;
                 std::uint8_t b = static_cast<std::uint8_t>(c);
                 if(b == CAN)
                 {
-                    if(++can_count_ >= 5)
+                    if(++self.can_count_ >= 5)
                         return hdr_status::cancelled;
-                    hs_ = hdr_state::search;
+                    self.hs_ = hdr_state::search;
                     continue;
                 }
-                can_count_ = 0;
+                self.can_count_ = 0;
                 if(b == XON || b == XOFF)
                     continue;
                 if(b == ZBIN)
                 {
-                    start_header(false);
-                    hs_ = hdr_state::bin;
+                    self.start_header(false);
+                    self.hs_ = hdr_state::bin;
                     continue;
                 }
                 if(b == ZBIN32)
                 {
-                    start_header(true);
-                    hs_ = hdr_state::bin;
+                    self.start_header(true);
+                    self.hs_ = hdr_state::bin;
                     continue;
                 }
                 if(b == ZHEX)
                 {
-                    start_header(false);
-                    hs_ = hdr_state::hex;
+                    self.start_header(false);
+                    self.hs_ = hdr_state::hex;
                     continue;
                 }
-                hs_ = hdr_state::search;
+                self.hs_ = hdr_state::search;
                 continue;
             }
             case hdr_state::bin:
             {
                 std::uint8_t b;
-                auto r = read_escaped(get, b);
+                auto r = self.read_escaped(b);
                 if(r == byte_status::pending)
                     return hdr_status::pending;
                 if(r == byte_status::cancelled)
                     return hdr_status::cancelled;
                 if(r == byte_status::frame_end || r == byte_status::error)
                 {
-                    hs_ = hdr_state::search;
+                    self.hs_ = hdr_state::search;
                     return hdr_status::error;
                 }
-                header_append(b);
-                std::size_t need = hdr_32_ ? 9 : 7;
-                if(hdr_pos_ == need)
-                    return finish_header(h);
+                self.header_append(b);
+                std::size_t need = self.hdr_32_ ? 9 : 7;
+                if(self.hdr_pos_ == need)
+                    return self.finish_header(h);
                 continue;
             }
             case hdr_state::hex:
             {
-                int c = get();
+                int c = self.get_byte();
                 if(c < 0)
                     return hdr_status::pending;
                 std::uint8_t b = static_cast<std::uint8_t>(c);
                 if(b == XON || b == XOFF)
                     continue;
-                int nib = hex_value(b);
+                int nib = self.hex_value(b);
                 if(nib < 0)
                 {
-                    hs_ = hdr_state::search;
+                    self.hs_ = hdr_state::search;
                     return hdr_status::error;
                 }
-                if(hex_nibble_ < 0)
+                if(self.hex_nibble_ < 0)
                 {
-                    hex_nibble_ = nib;
+                    self.hex_nibble_ = nib;
                     continue;
                 }
-                std::uint8_t v = static_cast<std::uint8_t>((hex_nibble_ << 4) | nib);
-                hex_nibble_ = -1;
-                header_append(v);
-                if(hdr_pos_ == 7)
+                std::uint8_t v = static_cast<std::uint8_t>((self.hex_nibble_ << 4) | nib);
+                self.hex_nibble_ = -1;
+                self.header_append(v);
+                if(self.hdr_pos_ == 7)
                 {
-                    if(hdr_crc16_ != 0)
+                    if(self.hdr_crc16_ != 0)
                     {
-                        hs_ = hdr_state::search;
+                        self.hs_ = hdr_state::search;
                         return hdr_status::error;
                     }
-                    hex_lf_ = false;
-                    hs_ = hdr_state::hex_end;
+                    self.hex_lf_ = false;
+                    self.hs_ = hdr_state::hex_end;
                 }
                 continue;
             }
             case hdr_state::hex_end:
             {
-                int c = get();
+                int c = self.get_byte();
                 if(c < 0)
                     return hdr_status::pending;
                 std::uint8_t b = static_cast<std::uint8_t>(c);
-                if(!hex_lf_)
+                if(!self.hex_lf_)
                 {
                     if(b == 0x0D || b == 0x8D)
                     {
-                        hex_lf_ = true;
+                        self.hex_lf_ = true;
                         continue;
                     }
                     if(b != 0x0A && b != 0x8A)
-                        pushback_ = b;
+                        self.pushback_ = b;
                 }
                 else
                 {
-                    hex_lf_ = false;
+                    self.hex_lf_ = false;
                     if(b != 0x0A && b != 0x8A)
-                        pushback_ = b;
+                        self.pushback_ = b;
                 }
-                commit_header(h);
+                self.commit_header(h);
                 return hdr_status::ok;
             }
             }
@@ -727,12 +726,12 @@ private:
         pushback_ = -1;
     }
 
-    data_status poll_data(auto &&get, std::uint8_t &end)
+    data_status poll_data(this auto &&self, std::uint8_t &end)
     {
         for(;;)
         {
             std::uint8_t b;
-            auto r = read_escaped(get, b);
+            auto r = self.read_escaped(b);
             if(r == byte_status::pending)
                 return data_status::pending;
             if(r == byte_status::cancelled)
@@ -740,46 +739,46 @@ private:
             if(r == byte_status::error)
                 return data_status::error;
 
-            if(!data_in_crc_)
+            if(!self.data_in_crc_)
             {
                 if(r == byte_status::frame_end)
                 {
-                    data_end_ = b;
-                    data_in_crc_ = true;
-                    data_crc_pos_ = 0;
-                    if(data_32_)
-                        data_crc32_ = crc32_byte(data_crc32_, b);
+                    self.data_end_ = b;
+                    self.data_in_crc_ = true;
+                    self.data_crc_pos_ = 0;
+                    if(self.data_32_)
+                        self.data_crc32_ = self.crc32_byte(self.data_crc32_, b);
                     else
-                        data_crc16_ = crc16_byte(data_crc16_, b);
+                        self.data_crc16_ = self.crc16_byte(self.data_crc16_, b);
                     continue;
                 }
-                if(data_len_ >= MAX_BLOCK)
+                if(self.data_len_ >= MAX_BLOCK)
                     return data_status::error;
-                buf_[data_len_++] = static_cast<std::byte>(b);
-                if(data_32_)
-                    data_crc32_ = crc32_byte(data_crc32_, b);
+                self.buf_[self.data_len_++] = static_cast<std::byte>(b);
+                if(self.data_32_)
+                    self.data_crc32_ = self.crc32_byte(self.data_crc32_, b);
                 else
-                    data_crc16_ = crc16_byte(data_crc16_, b);
+                    self.data_crc16_ = self.crc16_byte(self.data_crc16_, b);
                 continue;
             }
 
             if(r == byte_status::frame_end)
                 return data_status::error;
-            if(data_32_)
-                data_crc32_ = crc32_byte(data_crc32_, b);
+            if(self.data_32_)
+                self.data_crc32_ = self.crc32_byte(self.data_crc32_, b);
             else
-                data_crc16_ = crc16_byte(data_crc16_, b);
-            ++data_crc_pos_;
+                self.data_crc16_ = self.crc16_byte(self.data_crc16_, b);
+            ++self.data_crc_pos_;
 
-            std::size_t need = data_32_ ? 4 : 2;
-            if(data_crc_pos_ == need)
+            std::size_t need = self.data_32_ ? 4 : 2;
+            if(self.data_crc_pos_ == need)
             {
-                bool ok = data_32_ ? data_crc32_ == CRC32_RESIDUE
-                                   : data_crc16_ == 0;
+                bool ok = self.data_32_ ? self.data_crc32_ == CRC32_RESIDUE
+                                        : self.data_crc16_ == 0;
                 if(!ok)
                     return data_status::error;
-                end = data_end_;
-                data_in_crc_ = false;
+                end = self.data_end_;
+                self.data_in_crc_ = false;
                 return data_status::ok;
             }
         }
@@ -834,84 +833,84 @@ private:
             filesize_ = v;
     }
 
-    void apply_file_and_zrpos(auto &&put)
+    void apply_file_and_zrpos(this auto &&self)
     {
-        parse_file_info();
+        self.parse_file_info();
 
-        std::size_t offset = opt_.resume_offset;
-        if(filesize_ != kUnknown && offset > filesize_)
+        std::size_t offset = self.opt_.resume_offset;
+        if(self.filesize_ != kUnknown && offset > self.filesize_)
             offset = 0;
-        received_ = offset;
-        send_position_header(put, ZRPOS, received_);
-        ph_ = phase::data;
-        data_active_ = false;
-        discard_ = false;
-        sub_ = sub_purpose::none;
-        reset_data();
+        self.received_ = offset;
+        self.send_position_header(ZRPOS, self.received_);
+        self.ph_ = phase::data;
+        self.data_active_ = false;
+        self.discard_ = false;
+        self.sub_ = sub_purpose::none;
+        self.reset_data();
     }
 
     // 处理跟随头部的数据子包（ZSINIT/ZFILE/ZSTDERR/跳过后续文件）。
-    bool drive_sub(auto &&get, auto &&put)
+    bool drive_sub(this auto &&self)
     {
         std::uint8_t end;
-        auto r = poll_data(get, end);
+        auto r = self.poll_data(end);
         switch(r)
         {
         case data_status::pending:
             return false;
         case data_status::cancelled:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::cancelled;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::cancelled;
             throw cancelled{};
         case data_status::error:
-            send_position_header(put, ZNAK, 0);
-            clear_data();
+            self.send_position_header(ZNAK, 0);
+            self.clear_data();
             return false;
         case data_status::ok:
             break;
         }
 
-        switch(sub_)
+        switch(self.sub_)
         {
         case sub_purpose::sinit:
-            send_position_header(put, ZACK, 1);
-            clear_data();
+            self.send_position_header(ZACK, 1);
+            self.clear_data();
             return false;
         case sub_purpose::zfile:
-            apply_file_and_zrpos(put);
+            self.apply_file_and_zrpos();
             return true;
         case sub_purpose::skip:
-            send_position_header(put, ZSKIP, 0);
-            clear_data();
+            self.send_position_header(ZSKIP, 0);
+            self.clear_data();
             return false;
         case sub_purpose::discard:
         case sub_purpose::none:
-            clear_data();
+            self.clear_data();
             return false;
         }
-        clear_data();
+        self.clear_data();
         return false;
     }
 
-    bool drive_wait_file(auto &&get, auto &&put)
+    bool drive_wait_file(this auto &&self)
     {
-        if(sub_ != sub_purpose::none)
-            return drive_sub(get, put);
+        if(self.sub_ != sub_purpose::none)
+            return self.drive_sub();
 
         header h;
-        auto r = poll_header(get, h);
+        auto r = self.poll_header(h);
         switch(r)
         {
         case hdr_status::pending:
             return false;
         case hdr_status::cancelled:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::cancelled;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::cancelled;
             throw cancelled{};
         case hdr_status::error:
-            send_position_header(put, ZNAK, 0);
+            self.send_position_header(ZNAK, 0);
             return false;
         case hdr_status::ok:
             break;
@@ -920,59 +919,59 @@ private:
         switch(h.type)
         {
         case ZRQINIT:
-            send_zrinit(put);
+            self.send_zrinit();
             return false;
         case ZSINIT:
-            sub_ = sub_purpose::sinit;
-            data_active_ = true;
-            data_32_ = h.crc32;
-            reset_data();
+            self.sub_ = sub_purpose::sinit;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
             return false;
         case ZFILE:
             if(h.info[ZF2] != 0 || h.info[ZF3] != 0)
             {
                 // 不支持压缩/加密/RLE/稀疏扩展，避免把非原始内容交付给调用方。
-                send_cancel(put);
-                ph_ = phase::done;
-                end_ = end_state::failed;
+                self.send_cancel();
+                self.ph_ = phase::done;
+                self.end_ = end_state::failed;
                 throw failed{};
             }
-            sub_ = sub_purpose::zfile;
-            data_active_ = true;
-            data_32_ = h.crc32;
-            reset_data();
+            self.sub_ = sub_purpose::zfile;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
             return false;
         case ZSTDERR:
-            sub_ = sub_purpose::discard;
-            data_active_ = true;
-            data_32_ = h.crc32;
-            reset_data();
+            self.sub_ = sub_purpose::discard;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
             return false;
         case ZFREECNT:
-            send_position_header(put, ZACK, 0);
+            self.send_position_header(ZACK, 0);
             return false;
         case ZCHALLENGE:
-            send_position_header(put, ZACK, position(h));
+            self.send_position_header(ZACK, position(h));
             return false;
         case ZFIN:
-            send_position_header(put, ZFIN, 0);
-            ph_ = phase::done;
-            end_ = end_state::failed;
+            self.send_position_header(ZFIN, 0);
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
             throw failed{};
         case ZCAN:
         case ZABORT:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::cancelled;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::cancelled;
             throw cancelled{};
         case ZFERR:
-            ph_ = phase::done;
-            end_ = end_state::failed;
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
             throw failed{};
         case ZCOMMAND:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::failed;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
             throw failed{};
         default:
             return false;
@@ -986,110 +985,110 @@ private:
         return filesize_ - received_;
     }
 
-    bool drive_data(auto &&get, auto &&put, auto &&f)
+    bool drive_data(this auto &&self, auto &&f)
     {
         std::uint8_t end;
-        auto r = poll_data(get, end);
+        auto r = self.poll_data(end);
         switch(r)
         {
         case data_status::pending:
             return false;
         case data_status::cancelled:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::cancelled;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::cancelled;
             throw cancelled{};
         case data_status::error:
-            send_position_header(put, ZRPOS, received_);
-            data_active_ = false;
-            discard_ = false;
-            reset_data();
+            self.send_position_header(ZRPOS, self.received_);
+            self.data_active_ = false;
+            self.discard_ = false;
+            self.reset_data();
             return false;
         case data_status::ok:
             break;
         }
 
-        if(discard_)
+        if(self.discard_)
         {
             bool done = end == ZCRCW || end == ZCRCE || end == ZCRCQ;
             if(done)
             {
-                send_position_header(put, ZRPOS, received_);
-                data_active_ = false;
-                discard_ = false;
+                self.send_position_header(ZRPOS, self.received_);
+                self.data_active_ = false;
+                self.discard_ = false;
             }
-            reset_data();
+            self.reset_data();
             return false;
         }
 
-        std::size_t deliver = data_len_;
-        if(filesize_ != kUnknown && received_ < filesize_)
-            deliver = std::min(deliver, filesize_ - received_);
-        else if(filesize_ != kUnknown)
+        std::size_t deliver = self.data_len_;
+        if(self.filesize_ != kUnknown && self.received_ < self.filesize_)
+            deliver = std::min(deliver, self.filesize_ - self.received_);
+        else if(self.filesize_ != kUnknown)
             deliver = 0;
 
         if(deliver != 0)
-            f(std::span<std::byte>{buf_.data(), deliver});
-        received_ += data_len_;
+            self.deliver_bytes(f, self.buf_.data(), deliver);
+        self.received_ += self.data_len_;
 
         if(end == ZCRCQ)
-            send_position_header(put, ZACK, received_);
+            self.send_position_header(ZACK, self.received_);
         else if(end == ZCRCW)
         {
-            send_position_header(put, ZACK, received_);
-            data_active_ = false;
+            self.send_position_header(ZACK, self.received_);
+            self.data_active_ = false;
         }
         else if(end == ZCRCE)
-            data_active_ = false;
+            self.data_active_ = false;
         // ZCRCG: 继续读下一个子包
 
-        reset_data();
+        self.reset_data();
         return false;
     }
 
-    std::size_t receive_impl(auto &&get, auto &&put, auto &&f)
+    std::size_t receive_impl(this auto &&self, auto &&f)
     {
-        if(ph_ == phase::idle)
+        if(self.ph_ == phase::idle)
         {
-            (void)start_link_impl(get, put, options{});
+            (void)self.start_link_impl(options{});
             return kUnknown;
         }
-        if(ph_ == phase::wait_file)
+        if(self.ph_ == phase::wait_file)
         {
-            (void)start_link_impl(get, put, opt_);
+            (void)self.start_link_impl(self.opt_);
             return kUnknown;
         }
-        throw_if_ended();
-        if(ph_ == phase::file_done || ph_ == phase::done)
+        self.throw_if_ended();
+        if(self.ph_ == phase::file_done || self.ph_ == phase::done)
             return 0;
-        if(ph_ != phase::data)
+        if(self.ph_ != phase::data)
             return kUnknown;
 
-        if(sub_ != sub_purpose::none)
+        if(self.sub_ != sub_purpose::none)
         {
-            (void)drive_sub(get, put);
-            return remaining();
+            (void)self.drive_sub();
+            return self.remaining();
         }
 
-        if(data_active_)
+        if(self.data_active_)
         {
-            (void)drive_data(get, put, f);
-            return remaining();
+            (void)self.drive_data(f);
+            return self.remaining();
         }
 
         header h;
-        auto r = poll_header(get, h);
+        auto r = self.poll_header(h);
         switch(r)
         {
         case hdr_status::pending:
             return kUnknown;
         case hdr_status::cancelled:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::cancelled;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::cancelled;
             throw cancelled{};
         case hdr_status::error:
-            send_position_header(put, ZNAK, 0);
+            self.send_position_header(ZNAK, 0);
             return kUnknown;
         case hdr_status::ok:
             break;
@@ -1100,133 +1099,133 @@ private:
         case ZDATA:
         {
             std::size_t pos = position(h);
-            discard_ = pos != received_;
-            data_active_ = true;
-            data_32_ = h.crc32;
-            reset_data();
+            self.discard_ = pos != self.received_;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
             return kUnknown;
         }
         case ZEOF:
-            if(position(h) == received_)
+            if(position(h) == self.received_)
             {
-                if(filesize_ != kUnknown && received_ < filesize_)
+                if(self.filesize_ != kUnknown && self.received_ < self.filesize_)
                 {
                     // 声明的文件大小还没收满就 EOF：中止并报告失败。
-                    send_cancel(put);
-                    ph_ = phase::done;
-                    end_ = end_state::failed;
+                    self.send_cancel();
+                    self.ph_ = phase::done;
+                    self.end_ = end_state::failed;
                     throw failed{};
                 }
-                ph_ = phase::file_done;
+                self.ph_ = phase::file_done;
                 return 0;
             }
-            send_position_header(put, ZRPOS, received_);
+            self.send_position_header(ZRPOS, self.received_);
             return kUnknown;
         case ZCAN:
         case ZABORT:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::cancelled;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::cancelled;
             throw cancelled{};
         case ZFERR:
-            ph_ = phase::done;
-            end_ = end_state::failed;
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
             throw failed{};
         case ZCOMMAND:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::failed;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
             throw failed{};
         case ZFIN:
-            send_position_header(put, ZFIN, 0);
-            ph_ = phase::done;
-            end_ = end_state::failed;
+            self.send_position_header(ZFIN, 0);
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
             throw failed{};
         case ZFILE:
         case ZSINIT:
             // 单文件接收过程中又出现文件/初始化头，视为协议错误。
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::failed;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
             throw failed{};
         case ZSTDERR:
-            sub_ = sub_purpose::discard;
-            data_active_ = true;
-            data_32_ = h.crc32;
-            reset_data();
+            self.sub_ = sub_purpose::discard;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
             return kUnknown;
         case ZFREECNT:
-            send_position_header(put, ZACK, 0);
+            self.send_position_header(ZACK, 0);
             return kUnknown;
         case ZCHALLENGE:
-            send_position_header(put, ZACK, position(h));
+            self.send_position_header(ZACK, position(h));
             return kUnknown;
         default:
             return kUnknown;
         }
     }
 
-    bool start_link_impl(auto &&get, auto &&put, const options &opt)
+    bool start_link_impl(this auto &&self, const options &opt)
     {
-        switch(ph_)
+        switch(self.ph_)
         {
         case phase::idle:
-            opt_ = opt;
-            send_zrinit(put);
-            ph_ = phase::wait_file;
-            sub_ = sub_purpose::none;
-            data_active_ = false;
-            reset_parser();
-            reset_data();
+            self.opt_ = opt;
+            self.send_zrinit();
+            self.ph_ = phase::wait_file;
+            self.sub_ = sub_purpose::none;
+            self.data_active_ = false;
+            self.reset_parser();
+            self.reset_data();
             return false;
         case phase::wait_file:
-            return drive_wait_file(get, put);
+            return self.drive_wait_file();
         case phase::data:
             return true;
         case phase::file_done:
         case phase::done:
-            throw_if_ended();
+            self.throw_if_ended();
             return true;
         }
         return true;
     }
 
-    bool finish_batch_impl(auto &&get, auto &&put)
+    bool finish_batch_impl(this auto &&self)
     {
-        if(ph_ == phase::done)
+        if(self.ph_ == phase::done)
         {
-            throw_if_ended();
+            self.throw_if_ended();
             return true;
         }
-        if(ph_ != phase::file_done)
+        if(self.ph_ != phase::file_done)
             return false;
 
-        if(!batch_started_)
+        if(!self.batch_started_)
         {
-            send_zrinit(put);
-            batch_started_ = true;
+            self.send_zrinit();
+            self.batch_started_ = true;
             return false;
         }
 
-        if(sub_ != sub_purpose::none)
+        if(self.sub_ != sub_purpose::none)
         {
-            (void)drive_sub(get, put);
+            (void)self.drive_sub();
             return false;
         }
 
         header h;
-        auto r = poll_header(get, h);
+        auto r = self.poll_header(h);
         switch(r)
         {
         case hdr_status::pending:
             return false;
         case hdr_status::cancelled:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::cancelled;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::cancelled;
             throw cancelled{};
         case hdr_status::error:
-            send_position_header(put, ZNAK, 0);
+            self.send_position_header(ZNAK, 0);
             return false;
         case hdr_status::ok:
             break;
@@ -1235,62 +1234,62 @@ private:
         switch(h.type)
         {
         case ZFILE:
-            sub_ = sub_purpose::skip;
-            data_active_ = true;
-            data_32_ = h.crc32;
-            reset_data();
+            self.sub_ = sub_purpose::skip;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
             return false;
         case ZSINIT:
-            sub_ = sub_purpose::sinit;
-            data_active_ = true;
-            data_32_ = h.crc32;
-            reset_data();
+            self.sub_ = sub_purpose::sinit;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
             return false;
         case ZSTDERR:
-            sub_ = sub_purpose::discard;
-            data_active_ = true;
-            data_32_ = h.crc32;
-            reset_data();
+            self.sub_ = sub_purpose::discard;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
             return false;
         case ZFIN:
-            send_position_header(put, ZFIN, 0);
-            ph_ = phase::done;
+            self.send_position_header(ZFIN, 0);
+            self.ph_ = phase::done;
             return true;
         case ZRQINIT:
-            send_zrinit(put);
+            self.send_zrinit();
             return false;
         case ZEOF:
-            send_zrinit(put);
+            self.send_zrinit();
             return false;
         case ZCAN:
         case ZABORT:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::cancelled;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::cancelled;
             throw cancelled{};
         case ZFERR:
-            ph_ = phase::done;
-            end_ = end_state::failed;
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
             throw failed{};
         case ZCOMMAND:
-            send_cancel(put);
-            ph_ = phase::done;
-            end_ = end_state::failed;
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
             throw failed{};
         default:
             return false;
         }
     }
 
-    void cancel_impl(auto &&put)
+    void cancel_impl(this auto &&self)
     {
-        if(ph_ == phase::idle || ph_ == phase::done)
+        if(self.ph_ == phase::idle || self.ph_ == phase::done)
             return;
-        send_cancel(put);
-        ph_ = phase::done;
-        end_ = end_state::cancelled;
-        reset_parser();
-        reset_data();
+        self.send_cancel();
+        self.ph_ = phase::done;
+        self.end_ = end_state::cancelled;
+        self.reset_parser();
+        self.reset_data();
         throw cancelled{};
     }
 };
