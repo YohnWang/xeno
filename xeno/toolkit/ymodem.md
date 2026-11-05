@@ -25,12 +25,19 @@ struct serial_io : xeno::ymodem_receiver
     {
         uart_write(static_cast<std::uint8_t>(c));
     }
+
+    // 可选：类内默认用 std::chrono::steady_clock；返回 int 或 int64_t 毫秒。
+    std::int64_t time() const
+    {
+        return board_millis();
+    }
 };
 ```
 
 `try_getchar()` 必须是单字节、非阻塞的，返回类型由类内 `static_assert` 强制为 `int`。
-类内不做任何等待、超时或重发计时。若底层缓冲区是 `char`/`int8_t`，返回前务必转
-`unsigned char`，否则 `0x80..0xFF` 会变成负数并被当作“暂无数据”。
+类内不做等待；半帧超时由 `time()` 计时并自动发 NAK，握手阶段完全没有收到字节时
+自动重发 `'C'`，连续 3 次无进展抛 `timeout`。若底层缓冲区是 `char`/`int8_t`，
+返回前务必转 `unsigned char`，否则 `0x80..0xFF` 会变成负数并被当作“暂无数据”。
 
 ## 公共接口
 
@@ -39,6 +46,11 @@ static constexpr std::size_t kUnknown;
 
 std::string filename() const;   // Block 0 解析成功后有效
 std::size_t filesize() const;   // kUnknown 表示发送方未提供大小
+
+std::int64_t time() const;      // 默认 steady_clock；可覆盖为 int/int64_t
+template<class Rep, class Period>
+void sleep_for(const std::chrono::duration<Rep, Period> &); // 默认 this_thread
+void set_timeout(std::uint32_t ms); // 默认 1000ms，0 表示关闭
 
 bool        start_link(this auto &&self);
 std::size_t receive(this auto &&self, auto &&f);
@@ -55,8 +67,10 @@ void        reset();
 |---|---|
 | `ymodem_receiver::cancelled` | 远端在帧头首字节发来 `CAN(0x18)` 或 `CTRL_C(0x03)`；`finish_batch()` 等待空 Block 0 时收到 CAN；或在中止后再次调用 `start_link()/receive()/finish_batch()` |
 | `ymodem_receiver::failed` | 握手阶段收到 EOT；收到空文件头（文件名为空）；已知文件大小但数据未收完就收到 EOT；`finish_batch()` 收到非空 Block 0（发送方还有下一个文件） |
+| `ymodem_receiver::timeout` | 握手阶段连续 3 次重发 `'C'` 无响应，或半帧连续 3 次 NAK 后仍无进展；继承 `failed` |
 
-两者都继承 `ymodem_receiver::error`，而 `ymodem_receiver::error` 继承 `std::exception`。
+`cancelled` 和 `failed` 继承 `ymodem_receiver::error`，`timeout` 继承 `failed`，
+最终都继承 `std::exception`。
 
 注意：
 
@@ -73,7 +87,11 @@ void        reset();
 
 - `phase` 处于 `data_phase / awaiting_eot` 时重复调用恒返回 `true`。
 - 正常结束后重复调用返回 `true`；异常结束后重复调用抛对应异常。
-- 握手超时由调用方处理：需要重新发 `'C'` 时执行 `reset()` 再 `start_link()`。
+- Block 0 收到一半且超过 `set_timeout()` 时间没有新字节时，发 NAK、丢弃半帧，
+  继续等发送方重发；连续 3 次超时无进展抛 `timeout`。
+- 等待 Block 0 期间完全没有收到任何字节时，每隔 `set_timeout()` 自动重发一次
+  `'C'`；连续 3 次仍无进展时发 CAN 并抛 `timeout`。
+- 收到过 Block 0 的任何字节后不再重发 `'C'`，半帧或坏帧只通过 NAK 重试。
 
 ### receive()
 
@@ -84,6 +102,8 @@ void        reset();
 | `1 .. kUnknown-1` | 剩余待交付的文件字节数 |
 
 - 自启动：`phase == idle` 时内部先执行一次 `start_link()` 并返回 `kUnknown`，因此不调用 `start_link()` 也能工作，只是握手阶段的异常会从 `receive()` 抛出。
+- 自启动后的 Block 0 等待与 `start_link()` 共用同一套 `'C'` 心跳；只调用 `receive()` 也会自动重发 `'C'`。
+- 数据帧收到一半超时：发 NAK、丢弃半帧，等发送方重发；连续 3 次超时无进展抛 `timeout`。
 - 远端中止时先回发 8 个 CAN，再抛 `cancelled`。
 - 已知文件大小但未收满就收到 EOT 时，先 ACK EOT，再抛 `failed`。
 - 已正常结束或 `phase == finished` 时调用不会回发任何字节。
@@ -104,12 +124,13 @@ bool finish_batch(this auto &&self);
 ### cancel() / reset()
 
 - `cancel()`：`idle` 或 `finished` 状态下是空操作；其余状态发送 8 个 `0x18`，进入 `finished`，并抛 `cancelled`。
-- `reset()`：回到 `idle`，清空文件名、大小、已收字节数和帧缓冲。用于同一会话中接收下一个文件，或中止后重新开始。
+- `reset()`：回到 `idle`，清空文件名、大小、已收字节数、帧缓冲和超时计数。用于同一会话中接收下一个文件，或中止后重新开始。
 
 ## 典型流程
 
 ```cpp
 serial_io rx;
+rx.set_timeout(3000); // 可选：'C' 重发周期/半帧超时，按对端调整
 
 try
 {
@@ -117,7 +138,8 @@ try
     {
         if(user_pressed_ctrl_c())
             rx.cancel();   // 活动传输中抛 cancelled，由外层统一处理
-        // 在这里做 'C' 重发计时：超时后 rx.reset(); rx.start_link();
+        // 'C' 重发与握手超时已由 start_link() 内部处理；
+        // 这里只需让出 CPU 或做取消/整体调度。
     }
 
     while(rx.receive([&](std::span<const std::byte> data) {
@@ -141,6 +163,10 @@ try
     }
 
     commit(file);   // 正常结束
+}
+catch(const xeno::ymodem_receiver::timeout &) // 先捕获 timeout（继承 failed）
+{
+    discard(file);
 }
 catch(const xeno::ymodem_receiver::cancelled &)
 {
@@ -244,7 +270,13 @@ payload 布局：`filename \0 filesize_decimal \0 [mtime ...]`
 - 默认不在 EOT ACK 时自动完成批处理结束握手：`receive()` 返回 0 后即结束。部分批处理发送端（如 lrzsz `sz`/`sb`）会继续等待接收方发 `'C'` 并 ACK 空文件头；需要调用可选的 `finish_batch()` 才能让发送端打印完成信息并退出。不调用时直接结束会话即可。
 - 不支持仅 128B 的 XMODEM 模式；握手固定发 `'C'`。
 - `filesize == kUnknown` 时尾部 `0x1A` 填充无法去除，结束由 EOT 决定。
-- 不限制重传次数；连续 NAK 或长时间无字节需要外层超时机制。
+- 帧内超时只覆盖“已经收到半帧”的情况；数据阶段整帧（包括首字节）全部丢失时仍需
+  调用方的整体超时机制。
+- 握手阶段只用“完全没有收到字节”判定发送方未启动。如果发送方已经发出 Block 0
+  但整帧丢失，接收端无法区分这两种情况；重发 `'C'` 不保证能让对端重传，仍可能
+  需要外层超时或重新发起。
+- 默认 `time()` 使用 `std::chrono::steady_clock`；裸机没有 chrono 时由派生类覆盖。
+- 默认超时 1000ms，可通过 `set_timeout()` 调整；该值要大于串口流控可能造成的最大暂停。
 - `try_getchar()` 一次只返回一个字节，不支持批量读取。
 - 文件大小偏小：多出的数据帧会被 ACK 并丢弃，不会报错；文件大小偏大：提前收到 EOT 会抛 `failed`。
 - `filename()` 直接来自发送方；落盘前应自行校验路径、长度和非法字符。
@@ -258,9 +290,9 @@ payload 布局：`filename \0 filesize_decimal \0 [mtime ...]`
 - 运行环境：QEMU `mps2-an500` + 半主机（`./build.sh` 的 `sim` 目标）
 - 测试代码：[`test/ymodem_test.cc`](../../test/ymodem_test.cc)（复制为 `arm_simulator/main.cc` 后执行 `./build.sh`）
 
-覆盖的用例包括：1K/SOH 正常传输、0 字节文件、未知大小、CRC/序号错误重传、重复帧、乱序帧、最后一帧重复、mtime 字段忽略、序号回绕、远端 CAN、远端 Ctrl+C、本地取消、Block 0 收到 EOT、空文件头、提前 EOT、reset 后接收第二个文件、不调用 `start_link()` 自启动、整包大小、1K 填充截断、非法大小字段、重复 Block 0、非法帧头、逐字节喂数据、数据段包含 `0x18/0x03`、回调抛异常、正常结束后取消，以及 `finish_batch()` 的正常完成、EOT 重传、下一文件、CAN 中止、未结束调用和逐字节喂数据。
+覆盖的用例包括：1K/SOH 正常传输、0 字节文件、未知大小、CRC/序号错误重传、重复帧、乱序帧、最后一帧重复、mtime 字段忽略、序号回绕、远端 CAN、远端 Ctrl+C、本地取消、Block 0 收到 EOT、空文件头、提前 EOT、reset 后接收第二个文件、不调用 `start_link()` 自启动、整包大小、1K 填充截断、非法大小字段、重复 Block 0、非法帧头、逐字节喂数据、数据段包含 `0x18/0x03`、回调抛异常、正常结束后取消、握手 `'C'` 自动重发与超时、半帧超时与超时异常，以及 `finish_batch()` 的正常完成、EOT 重传、下一文件、CAN 中止、未结束调用和逐字节喂数据。
 
-结果：34 组测试全部通过。
+结果：43 组测试全部通过。
 
 另外用真实 `lrzsz 0.12.21` 做了联调（socketpair + 非阻塞读）：
 

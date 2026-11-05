@@ -28,12 +28,19 @@ struct serial_io : xeno::zmodem_receiver
     {
         uart_write(static_cast<std::uint8_t>(c));
     }
+
+    // 可选：类内默认用 std::chrono::steady_clock；返回 int 或 int64_t 毫秒。
+    std::int64_t time() const
+    {
+        return board_millis();
+    }
 };
 ```
 
 `try_getchar()` 必须是单字节、非阻塞的，返回类型由类内 `static_assert` 强制为 `int`。
-类内不做任何等待、超时或重试计时。若底层缓冲区是 `char`/`int8_t`，返回前务必转
-`unsigned char`，否则 `0x80..0xFF` 会变成负数并被当作“暂无数据”。
+类内不做等待；半帧超时由 `time()` 计时并自动发 ZNAK/ZRPOS，握手阶段超时仍由调用方
+负责。若底层缓冲区是 `char`/`int8_t`，返回前务必转 `unsigned char`，否则
+`0x80..0xFF` 会变成负数并被当作“暂无数据”。
 
 ## 公共接口
 
@@ -48,6 +55,11 @@ struct options
 std::string filename() const;   // ZFILE 解析成功后有效
 std::size_t filesize() const;   // kUnknown 表示 ZFILE 未提供大小
 
+std::int64_t time() const;      // 默认 steady_clock；可覆盖为 int/int64_t
+template<class Rep, class Period>
+void sleep_for(const std::chrono::duration<Rep, Period> &); // 默认 this_thread
+void set_timeout(std::uint32_t ms); // 默认 1000ms，0 表示关闭
+
 bool        start_link(this auto &&self, const options &opt = {});
 std::size_t receive(this auto &&self, auto &&f);
 bool        finish_batch(this auto &&self);
@@ -61,8 +73,10 @@ void        reset();
 |---|---|
 | `zmodem_receiver::cancelled` | 本地 `cancel()`；远端 CAN 串 / ZCAN / ZABORT；中止后再次调用 |
 | `zmodem_receiver::failed` | 协议错误、ZFIN 提前出现、ZFERR、不支持的 ZCOMMAND/压缩/加密等 |
+| `zmodem_receiver::timeout` | 半帧长时间无新字节，连续 3 次 ZNAK/ZRPOS 后仍无进展；继承 `failed` |
 
-两者都继承 `zmodem_receiver::error`，`zmodem_receiver::error` 继承 `std::exception`。
+`cancelled` 和 `failed` 继承 `zmodem_receiver::error`，`timeout` 继承 `failed`，
+最终都继承 `std::exception`。
 
 - 本地 `cancel()` 在活跃会话中发完 10 个 CAN + 10 个 BS 后抛 `cancelled`；
   `idle/done` 状态下是空操作，不抛异常。
@@ -79,7 +93,10 @@ void        reset();
 - 第一次调用发送 ZRINIT，缓冲字段填 0（允许连续 I/O），并通告
   `CANFC32 | CANFDX | CANOVIO | ESCCTL` 能力。
 - 会处理 ZRQINIT、ZSINIT、ZFREECNT、ZCHALLENGE 等握手帧。
-- 握手超时由调用方处理；需要重新发起时执行 `reset()` 再 `start_link()`。
+- 头部或 ZFILE 元数据收到一半超时：发 ZNAK、丢弃半帧，等发送方重发；
+  连续 3 次超时无进展抛 `timeout`。
+- 握手阶段（还没收到任何帧字节）的超时仍由调用方处理；需要重新发起时执行
+  `reset()` 再 `start_link()`。
 
 ### receive()
 
@@ -92,6 +109,8 @@ void        reset();
 - `phase == idle` 时自启动：内部先执行一次默认参数的 `start_link()` 并返回
   `kUnknown`。需要 resume 时请显式调用 `start_link(options)`。
 - 数据子包先完成 CRC 校验，再交付给回调；CRC 错误时回 ZRPOS 请求重传。
+- 头部收到一半超时：发 ZNAK、重置解析器；数据子包收到一半超时：发
+  ZRPOS(received_)、丢弃半包；连续 3 次超时无进展抛 `timeout`。
 - 回调参数是**只读**数据，可声明为 span 或 C 式指针 + 长度，类会按回调可接受的
   形式交付：`std::span<const std::byte>` / `(const std::byte *, std::size_t)`、
   `std::span<const std::uint8_t>` / `(const std::uint8_t *, std::size_t)`、
@@ -107,6 +126,7 @@ void        reset();
   收到 ZFIN 后回 ZFIN 并返回 `true`。
 - 单文件模式下不会交付后续文件，只把它们跳过，让发送端（`sz`/`sb` 的批处理流程）
   能打印完成信息并正常退出。
+- 等待 ZFIN / ZFILE 时收到半帧超时，同样发 ZNAK 重试；连续失败抛 `timeout`。
 - 发送端不支持批处理结束握手时，会一直返回 `false`，需要外层超时后停止轮询。
 
 ### cancel() / reset()
@@ -317,7 +337,11 @@ data... ZDLE <end> crc...
 - 滑动窗口在发送端（`sz -w`），接收端只能配合。
 - 接收缓冲固定 8KB，ZRINIT 通告 0（允许连续 I/O）；超过 8KB 的数据子包会触发
   ZRPOS 重传。连续 I/O 的吞吐依赖接收端环形缓冲和回调速度。
-- 不限制重传次数；连续 NAK/ZRPOS 或长时间无数据需要外层超时机制。
+- 半帧超时只覆盖“已经收到部分头部/数据”的情况；整帧（包括首字节）全丢时没有
+  半帧状态，仍需调用方的握手/整体超时机制。
+- 默认 `time()` 使用 `std::chrono::steady_clock`；裸机没有 chrono 时由派生类覆盖。
+- 默认超时 1000ms，可通过 `set_timeout()` 调整；该值要大于串口流控可能造成的最大暂停。
+- CRC/协议错误的 NAK/ZRPOS 重传次数仍不限制。
 - `filename()` 直接来自发送方；落盘前应校验路径、长度和非法字符。
 - 非线程安全：`start_link()/receive()/finish_batch()/cancel()/reset()` 应在同一
   执行上下文调用。
@@ -333,7 +357,8 @@ data... ZDLE <end> crc...
   四种 ZCRCE/ZCRCG/ZCRCQ/ZCRCW 结尾、ZFILE 元数据、0 字节文件、未知大小、
   ZSINIT、ZRQINIT、ZFREECNT、ZCHALLENGE、ZCAN、ZABORT、ZCOMMAND、ZSTDERR、
   提前 ZEOF、压缩/加密标志拒绝、坏头 CRC 重同步、坏数据 CRC/ZRPOS、ZDATA
-  位置错重同步、resume、接收缓冲通告、批处理 ZSKIP、逐字节喂数据、本地取消。
+  位置错重同步、resume、接收缓冲通告、批处理 ZSKIP、逐字节喂数据、本地取消、
+  半帧头部/元数据/数据超时与超时异常。
 
 真实 lrzsz 联调：[`test/zmodem_sz_test.cc`](../../test/zmodem_sz_test.cc)
 

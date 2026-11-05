@@ -2,6 +2,7 @@
 
 #include<algorithm>
 #include<array>
+#include<chrono>
 #include<concepts>
 #include<cstddef>
 #include<cstdint>
@@ -9,6 +10,7 @@
 #include<limits>
 #include<span>
 #include<string>
+#include<thread>
 #include<type_traits>
 
 namespace xeno
@@ -21,8 +23,12 @@ namespace xeno
 //                       // 从 char/int8_t 取字节时先转 unsigned char，
 //                       // 否则 0x80..0xFF 会被符号扩展成负数。
 //   void putchar(int);  // 发送单字节
+// 可选覆盖：
+//   std::int64_t time() const;              // 默认 steady_clock，毫秒
+//   sleep_for(std::chrono::duration);       // 默认 this_thread::sleep_for
 // 通过 deducing this + 继承在编译期绑定，不检查返回值以外的 IO 状态。
-// 超时与重发 'C' 由调用方计时，类内不做等待。
+// 半帧长时间无新字节时类内发 NAK 重试；握手阶段完全没收到字节时
+// 类内重发 'C'。连续 3 次超时无进展后发 CAN 并抛 timeout。
 class ymodem_receiver
 {
 public:
@@ -55,6 +61,15 @@ public:
         }
     };
 
+    // 握手 'C' 或半帧重试长时间无新字节，且重试耗尽。
+    struct timeout : failed
+    {
+        const char *what() const noexcept override
+        {
+            return "ymodem: transfer timeout";
+        }
+    };
+
     std::string filename() const
     {
         return filename_;
@@ -65,14 +80,39 @@ public:
         return filesize_;
     }
 
+    // 可配置毫秒时钟；派生类可以隐藏它，返回 int 或 int64_t。
+    std::int64_t time() const
+    {
+        using namespace std::chrono;
+        return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    }
+
+    // 可配置延时接口；本类内部不会调用，供调用方或派生类使用。
+    template<typename Rep, typename Period>
+    void sleep_for(const std::chrono::duration<Rep, Period> &d)
+    {
+        std::this_thread::sleep_for(d);
+    }
+
+    // 握手/半帧无进展超时（毫秒）；0 关闭，默认 1000ms。
+    void set_timeout(std::uint32_t ms)
+    {
+        timeout_ms_ = ms;
+    }
+
     // ---- 建立连接 ----
-    // true 表示连接成功；false 表示继续轮询（已发 'C' 或 Block 0 未收完）。
+    // true 表示连接成功；false 表示继续轮询。
+    // 等待 Block 0 时如果一直没有任何字节，内部按 timeout 重发 'C'；
+    // 连续 3 次仍无进展则发 CAN 并抛 timeout。
     bool start_link(this auto &&self)
     {
         switch(self.ph_)
         {
         case phase::idle:
             self.put_byte(CRC_REQ);
+            self.last_c_tick_ = self.clock_value();
+            self.c_retry_count_ = 0;
+            self.block0_heard_ = false;
             self.ph_ = phase::wait_block0;
             self.reset_frame();
             return false;
@@ -241,6 +281,12 @@ public:
         filename_.clear();
         filesize_ = kUnknown;
         received_ = 0;
+        last_rx_tick_ = 0;
+        timeout_count_ = 0;
+        retry_pending_ = false;
+        last_c_tick_ = 0;
+        c_retry_count_ = 0;
+        block0_heard_ = false;
     }
 
 private:
@@ -274,7 +320,8 @@ private:
     {
         none,
         cancelled,
-        failed
+        failed,
+        timeout
     };
 
     enum class batch_state
@@ -300,6 +347,18 @@ private:
     std::size_t body_pos_ = 0;
     std::size_t body_len_ = 0;
 
+    std::uint64_t last_rx_tick_ = 0;
+    std::uint32_t timeout_ms_ = 1000;
+    std::uint32_t timeout_count_ = 0;
+    bool retry_pending_ = false;
+
+    // Block 0 握手阶段：完全没收到字节时周期性重发 'C'。
+    std::uint64_t last_c_tick_ = 0;
+    std::uint32_t c_retry_count_ = 0;
+    bool block0_heard_ = false;
+
+    static constexpr std::uint32_t MAX_TIMEOUTS = 3;
+
     int get_byte(this auto &&self)
     {
         static_assert(std::is_same_v<decltype(self.try_getchar()), int>,
@@ -310,6 +369,68 @@ private:
     void put_byte(this auto &&self, std::uint8_t c)
     {
         self.putchar(c);
+    }
+
+    std::uint64_t clock_value(this auto &&self)
+    {
+        using T = std::remove_cvref_t<decltype(self.time())>;
+        static_assert(std::is_same_v<T, int> || std::is_same_v<T, std::int64_t>,
+                      "time() must return int or int64_t");
+        using U = std::make_unsigned_t<T>;
+        return static_cast<std::uint64_t>(static_cast<U>(self.time()));
+    }
+
+    bool timeout_expired(this auto &&self, std::uint64_t last_tick)
+    {
+        using T = std::remove_cvref_t<decltype(self.time())>;
+        using U = std::make_unsigned_t<T>;
+        auto now = static_cast<U>(self.clock_value());
+        auto last = static_cast<U>(last_tick);
+        return static_cast<U>(now - last) >= static_cast<U>(self.timeout_ms_);
+    }
+
+    void check_timeout(this auto &&self)
+    {
+        if(self.timeout_ms_ == 0)
+            return;
+        bool partial = self.hdr_pos_ > 0 || self.body_pos_ > 0;
+        if(!partial && !self.retry_pending_)
+            return;
+        if(!self.timeout_expired(self.last_rx_tick_))
+            return;
+
+        self.put_byte(NAK);
+        if(partial)
+            self.reset_frame();
+        self.retry_pending_ = true;
+        self.last_rx_tick_ = self.clock_value();
+        if(++self.timeout_count_ >= MAX_TIMEOUTS)
+        {
+            self.send_cancel();
+            self.ph_ = phase::finished;
+            self.end_ = end_state::timeout;
+            throw timeout{};
+        }
+    }
+
+    void check_block0_timeout(this auto &&self)
+    {
+        if(self.timeout_ms_ == 0 || self.block0_heard_)
+            return;
+        if(self.hdr_pos_ != 0 || self.body_pos_ != 0)
+            return;
+        if(!self.timeout_expired(self.last_c_tick_))
+            return;
+
+        self.put_byte(CRC_REQ);
+        self.last_c_tick_ = self.clock_value();
+        if(++self.c_retry_count_ >= MAX_TIMEOUTS)
+        {
+            self.send_cancel();
+            self.ph_ = phase::finished;
+            self.end_ = end_state::timeout;
+            throw timeout{};
+        }
     }
 
     template<typename F>
@@ -348,6 +469,8 @@ private:
     {
         if(end_ == end_state::cancelled)
             throw cancelled{};
+        if(end_ == end_state::timeout)
+            throw timeout{};
         if(end_ == end_state::failed)
             throw failed{};
     }
@@ -407,11 +530,27 @@ private:
 
     read_result read_frame(this auto &&self)
     {
+        bool got = false;
         while(self.hdr_pos_ < HDR_SIZE)
         {
             int c = self.get_byte();
             if(c < 0)
+            {
+                if(got)
+                {
+                    self.last_rx_tick_ = self.clock_value();
+                    self.timeout_count_ = 0;
+                    self.retry_pending_ = false;
+                }
+                else
+                    self.check_timeout();
                 return read_result::pending;
+            }
+            got = true;
+            if(self.ph_ == phase::wait_block0)
+                self.block0_heard_ = true;
+            self.timeout_count_ = 0;
+            self.retry_pending_ = false;
             self.hdr_[self.hdr_pos_++] = static_cast<std::uint8_t>(c);
 
             // EOT/CAN 是单字节信号，必须在帧头首字节立即判断。
@@ -445,7 +584,22 @@ private:
         {
             int c = self.get_byte();
             if(c < 0)
+            {
+                if(got)
+                {
+                    self.last_rx_tick_ = self.clock_value();
+                    self.timeout_count_ = 0;
+                    self.retry_pending_ = false;
+                }
+                else
+                    self.check_timeout();
                 return read_result::pending;
+            }
+            got = true;
+            if(self.ph_ == phase::wait_block0)
+                self.block0_heard_ = true;
+            self.timeout_count_ = 0;
+            self.retry_pending_ = false;
             self.body_[self.body_pos_++] = static_cast<std::byte>(c);
         }
 
@@ -485,6 +639,8 @@ private:
         switch(r)
         {
         case read_result::pending:
+            self.check_block0_timeout();
+            return false;
         case read_result::error:
         case read_result::duplicate:
             return false;

@@ -2,6 +2,7 @@
 
 #include<algorithm>
 #include<array>
+#include<chrono>
 #include<concepts>
 #include<cstddef>
 #include<cstdint>
@@ -9,6 +10,7 @@
 #include<limits>
 #include<span>
 #include<string>
+#include<thread>
 #include<type_traits>
 
 namespace xeno
@@ -21,8 +23,12 @@ namespace xeno
 //                       // 从 char/int8_t 取字节时先转 unsigned char，
 //                       // 否则 0x80..0xFF 会被符号扩展成负数。
 //   void putchar(int);  // 发送单字节
+// 可选覆盖：
+//   std::int64_t time() const;              // 默认 steady_clock，毫秒
+//   sleep_for(std::chrono::duration);       // 默认 this_thread::sleep_for
 // 通过 deducing this + 继承在编译期绑定，不检查返回值以外的 IO 状态。
-// 超时与重试由调用方计时，类内不做等待。
+// 半帧长时间无新字节时类内发 ZNAK/ZRPOS 重试，连续失败抛 timeout；
+// 握手阶段超时仍由调用方处理。
 //
 // 所有文件内容都按原始二进制交付，不做 CR/LF 或字符集转换。
 class zmodem_receiver
@@ -64,6 +70,15 @@ public:
         }
     };
 
+    // 半帧长时间无新字节，且重试耗尽。
+    struct timeout : failed
+    {
+        const char *what() const noexcept override
+        {
+            return "zmodem: transfer timeout";
+        }
+    };
+
     std::string filename() const
     {
         return filename_;
@@ -74,11 +89,35 @@ public:
         return filesize_;
     }
 
+    // 可配置毫秒时钟；派生类可以隐藏它，返回 int 或 int64_t。
+    std::int64_t time() const
+    {
+        using namespace std::chrono;
+        return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    }
+
+    // 可配置延时接口；本类内部不会调用，供调用方或派生类使用。
+    template<typename Rep, typename Period>
+    void sleep_for(const std::chrono::duration<Rep, Period> &d)
+    {
+        std::this_thread::sleep_for(d);
+    }
+
+    // 半帧无进展超时（毫秒）；0 关闭，默认 1000ms。
+    void set_timeout(std::uint32_t ms)
+    {
+        timeout_ms_ = ms;
+    }
+
     // ---- 建立连接 ----
     // true 表示已收到 ZFILE 并发出 ZRPOS；false 表示继续轮询。
     bool start_link(this auto &&self, const options &opt = {})
     {
-        return self.start_link_impl(opt);
+        self.check_timeout();
+        self.progressed_ = false;
+        bool r = self.start_link_impl(opt);
+        self.note_progress();
+        return r;
     }
 
     // ---- 接收当前文件 ----
@@ -86,7 +125,11 @@ public:
     // 其余为剩余待交付字节数（filesize 已知时）。
     std::size_t receive(this auto &&self, auto &&f)
     {
-        return self.receive_impl(f);
+        self.check_timeout();
+        self.progressed_ = false;
+        auto r = self.receive_impl(f);
+        self.note_progress();
+        return r;
     }
 
     // ---- 结束 ZMODEM 批处理 ----
@@ -94,7 +137,11 @@ public:
     // 发 ZRINIT，后续文件用 ZSKIP 跳过，收到 ZFIN 并回 ZFIN 后返回 true。
     bool finish_batch(this auto &&self)
     {
-        return self.finish_batch_impl();
+        self.check_timeout();
+        self.progressed_ = false;
+        bool r = self.finish_batch_impl();
+        self.note_progress();
+        return r;
     }
 
     // ---- 本地用户按 Ctrl+C 时调用：发 CAN 串并抛 cancelled ----
@@ -116,6 +163,11 @@ public:
         batch_started_ = false;
         data_active_ = false;
         discard_ = false;
+        last_rx_tick_ = 0;
+        timeout_count_ = 0;
+        retry_pending_ = false;
+        retry_zrpos_ = false;
+        progressed_ = false;
         reset_data();
         reset_parser();
     }
@@ -186,7 +238,8 @@ private:
     {
         none,
         cancelled,
-        failed
+        failed,
+        timeout
     };
 
     enum class sub_purpose
@@ -279,6 +332,14 @@ private:
     bool hex_lf_ = false;
     int pushback_ = -1;
 
+    std::uint64_t last_rx_tick_ = 0;
+    std::uint32_t timeout_ms_ = 1000;
+    std::uint32_t timeout_count_ = 0;
+    bool retry_pending_ = false;
+    bool retry_zrpos_ = false;
+    bool progressed_ = false;
+    static constexpr std::uint32_t MAX_TIMEOUTS = 3;
+
     int get_byte(this auto &&self)
     {
         static_assert(std::is_same_v<decltype(self.try_getchar()), int>,
@@ -287,14 +348,97 @@ private:
         {
             int c = self.pushback_;
             self.pushback_ = -1;
+            self.progressed_ = true;
             return c;
         }
-        return self.try_getchar();
+        int c = self.try_getchar();
+        if(c >= 0)
+            self.progressed_ = true;
+        return c;
     }
 
     void put_byte(this auto &&self, std::uint8_t c)
     {
         self.putchar(c);
+    }
+
+    std::uint64_t clock_value(this auto &&self)
+    {
+        using T = std::remove_cvref_t<decltype(self.time())>;
+        static_assert(std::is_same_v<T, int> || std::is_same_v<T, std::int64_t>,
+                      "time() must return int or int64_t");
+        using U = std::make_unsigned_t<T>;
+        return static_cast<std::uint64_t>(static_cast<U>(self.time()));
+    }
+
+    bool timeout_expired(this auto &&self)
+    {
+        using T = std::remove_cvref_t<decltype(self.time())>;
+        using U = std::make_unsigned_t<T>;
+        auto now = static_cast<U>(self.clock_value());
+        auto last = static_cast<U>(self.last_rx_tick_);
+        return static_cast<U>(now - last) >= static_cast<U>(self.timeout_ms_);
+    }
+
+    void note_progress(this auto &&self)
+    {
+        if(self.progressed_)
+        {
+            self.last_rx_tick_ = self.clock_value();
+            self.timeout_count_ = 0;
+            self.retry_pending_ = false;
+            self.progressed_ = false;
+        }
+    }
+
+    void check_timeout(this auto &&self)
+    {
+        if(self.timeout_ms_ == 0 || self.ph_ == phase::done)
+            return;
+        bool partial_header = self.hs_ != hdr_state::search;
+        bool partial_data = self.data_active_;
+        if(!partial_header && !partial_data && !self.retry_pending_)
+            return;
+        if(!self.timeout_expired())
+            return;
+
+        if(partial_data)
+        {
+            if(self.sub_ != sub_purpose::none)
+            {
+                self.send_position_header(ZNAK, 0);
+                self.clear_data();
+                self.retry_zrpos_ = false;
+            }
+            else
+            {
+                self.send_position_header(ZRPOS, self.received_);
+                self.data_active_ = false;
+                self.discard_ = false;
+                self.reset_data();
+                self.retry_zrpos_ = true;
+            }
+        }
+        else if(partial_header)
+        {
+            self.send_position_header(ZNAK, 0);
+            self.reset_parser();
+            self.retry_zrpos_ = false;
+        }
+        else if(self.retry_zrpos_)
+            self.send_position_header(ZRPOS, self.received_);
+        else
+            self.send_position_header(ZNAK, 0);
+
+        self.retry_pending_ = true;
+        self.last_rx_tick_ = self.clock_value();
+        if(++self.timeout_count_ >= MAX_TIMEOUTS)
+        {
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::timeout;
+            throw timeout{};
+        }
     }
 
     template<typename F>
@@ -328,6 +472,8 @@ private:
     {
         if(end_ == end_state::cancelled)
             throw cancelled{};
+        if(end_ == end_state::timeout)
+            throw timeout{};
         if(end_ == end_state::failed)
             throw failed{};
     }
