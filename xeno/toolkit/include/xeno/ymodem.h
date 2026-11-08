@@ -27,14 +27,32 @@ namespace xeno
 //   std::int64_t time() const;              // 默认 steady_clock，毫秒
 //   sleep_for(std::chrono::duration);       // 默认 this_thread::sleep_for
 // 通过 deducing this + 继承在编译期绑定，不检查返回值以外的 IO 状态。
-// 半帧长时间无新字节时类内发 NAK 重试；握手阶段完全没收到字节时
-// 类内重发 'C'。连续 3 次超时无进展后发 CAN 并抛 timeout。
+// try_link()/try_receive()/try_finish_batch() 非阻塞；
+// link()/receive()/finish_batch() 阻塞并处理重试与超时。
 class ymodem_receiver
 {
+    template<typename F>
+    static constexpr bool is_consumer =
+        std::invocable<F &, std::span<const std::byte>>
+        || std::invocable<F &, const std::byte *, std::size_t>
+        || std::invocable<F &, std::span<const std::uint8_t>>
+        || std::invocable<F &, const std::uint8_t *, std::size_t>
+        || std::invocable<F &, std::span<const char>>
+        || std::invocable<F &, const char *, std::size_t>
+        || std::invocable<F &, std::span<const std::int8_t>>
+        || std::invocable<F &, const std::int8_t *, std::size_t>;
+
+    template<typename T>
+    static constexpr bool is_data_element =
+        std::same_as<T, std::byte> || std::same_as<T, std::uint8_t>
+        || std::same_as<T, char> || std::same_as<T, std::int8_t>;
+
+    static constexpr std::chrono::milliseconds poll_interval{10};
+
 public:
     static constexpr std::size_t kUnknown = std::numeric_limits<std::size_t>::max();
 
-    // 传输非正常结束。start_link()/receive()/finish_batch() 在终止状态下抛出。
+    // 传输非正常结束。link()/receive()/finish_batch() 在终止状态下抛出。
     struct error : std::exception
     {
         const char *what() const noexcept override
@@ -43,7 +61,7 @@ public:
         }
     };
 
-    // 本地 cancel()、远端 CAN/CTRL-C，或中止后再次调用 start_link()/receive()/finish_batch()。
+    // 本地 cancel()、远端 CAN/CTRL-C，或中止后再次调用 link()/receive()/finish_batch()。
     struct cancelled : error
     {
         const char *what() const noexcept override
@@ -52,7 +70,7 @@ public:
         }
     };
 
-    // 握手阶段收到 EOT、空文件头，或数据未收完就收到 EOT。
+    // 握手阶段收到 EOT、空文件头、未知文件大小，或数据未收完就收到 EOT。
     struct failed : error
     {
         const char *what() const noexcept override
@@ -61,7 +79,7 @@ public:
         }
     };
 
-    // 握手 'C' 或半帧重试长时间无新字节，且重试耗尽。
+    // 阻塞接口重试耗尽。
     struct timeout : failed
     {
         const char *what() const noexcept override
@@ -87,32 +105,92 @@ public:
         return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
     }
 
-    // 可配置延时接口；本类内部不会调用，供调用方或派生类使用。
+    // 可配置延时接口；link()/receive()/finish_batch() 使用它。
     template<typename Rep, typename Period>
     void sleep_for(const std::chrono::duration<Rep, Period> &d)
     {
         std::this_thread::sleep_for(d);
     }
 
-    // 握手/半帧无进展超时（毫秒）；0 关闭，默认 1000ms。
-    void set_timeout(std::uint32_t ms)
+    // 单参数：总时长，使用当前 retry interval 计算重试次数；
+    // 双参数：单次重试间隔 + 重试次数。
+    template<typename Rep, typename Period>
+    void set_link_timeout(this auto &&self,
+                          const std::chrono::duration<Rep, Period> &total)
     {
-        timeout_ms_ = ms;
+        using namespace std::chrono;
+        auto total_ms = duration_cast<milliseconds>(total).count();
+        if(total_ms <= 0)
+        {
+            self.link_retry_interval = milliseconds{0};
+            self.link_retries = 0;
+            return;
+        }
+        if(self.link_retry_interval.count() <= 0)
+            self.link_retry_interval = milliseconds{1000};
+        auto interval_ms = self.link_retry_interval.count();
+        auto retries = (static_cast<std::uint64_t>(total_ms) +
+                        static_cast<std::uint64_t>(interval_ms) - 1) /
+                       static_cast<std::uint64_t>(interval_ms);
+        self.link_retries = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(retries,
+                                    std::numeric_limits<std::uint32_t>::max()));
     }
 
-    // ---- 建立连接 ----
-    // true 表示连接成功；false 表示继续轮询。
-    // 等待 Block 0 时如果一直没有任何字节，内部按 timeout 重发 'C'；
-    // 连续 3 次仍无进展则发 CAN 并抛 timeout。
-    bool start_link(this auto &&self)
+    // 双参数：单次重试间隔 + 重试次数。
+    template<typename Rep, typename Period>
+    void set_link_timeout(this auto &&self,
+                          const std::chrono::duration<Rep, Period> &retry_interval,
+                          std::uint32_t retries)
+    {
+        self.link_retry_interval =
+            std::chrono::duration_cast<std::chrono::milliseconds>(retry_interval);
+        self.link_retries = retries == 0 ? 1 : retries;
+    }
+
+    template<typename Rep, typename Period>
+    void set_receive_timeout(this auto &&self,
+                             const std::chrono::duration<Rep, Period> &total)
+    {
+        using namespace std::chrono;
+        auto total_ms = duration_cast<milliseconds>(total).count();
+        if(total_ms <= 0)
+        {
+            self.receive_retry_interval = milliseconds{0};
+            self.receive_retries = 0;
+            return;
+        }
+        if(self.receive_retry_interval.count() <= 0)
+            self.receive_retry_interval = milliseconds{1000};
+        auto interval_ms = self.receive_retry_interval.count();
+        auto retries = (static_cast<std::uint64_t>(total_ms) +
+                        static_cast<std::uint64_t>(interval_ms) - 1) /
+                       static_cast<std::uint64_t>(interval_ms);
+        self.receive_retries = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(retries,
+                                    std::numeric_limits<std::uint32_t>::max()));
+    }
+
+    template<typename Rep, typename Period>
+    void set_receive_timeout(this auto &&self,
+                             const std::chrono::duration<Rep, Period> &retry_interval,
+                             std::uint32_t retries)
+    {
+        self.receive_retry_interval =
+            std::chrono::duration_cast<std::chrono::milliseconds>(retry_interval);
+        self.receive_retries = retries == 0 ? 1 : retries;
+    }
+
+    // ---- 建立连接（非阻塞单次处理，不抛 timeout） ----
+    bool try_link(this auto &&self)
     {
         switch(self.ph_)
         {
         case phase::idle:
             self.put_byte(CRC_REQ);
-            self.last_c_tick_ = self.clock_value();
-            self.c_retry_count_ = 0;
-            self.block0_heard_ = false;
+            self.last_link_tick_ = self.clock_value();
+            self.link_retry_count_ = 0;
+            self.progressed_ = false;
             self.ph_ = phase::wait_block0;
             self.reset_frame();
             return false;
@@ -122,92 +200,110 @@ public:
         case phase::awaiting_eot:
             return true;
         case phase::finished:
-            self.throw_if_ended();
+            if(self.end_ == end_state::timeout)
+                return false;
+            self.throw_if_ended_except_timeout();
             return true;
         }
         return true;
     }
 
-    // ---- 接收 ----
-    // 返回 0 表示 EOT 已确认；返回 kUnknown 表示继续；其余为剩余字节数。
-    // 远端中止抛 cancelled，提前收到 EOT 抛 failed。
-    std::size_t receive(this auto &&self, auto &&f)
+    // ---- 阻塞建立连接；超时发 CAN 并抛 timeout ----
+    void link(this auto &&self)
     {
-        if(self.ph_ == phase::idle)
-        {
-            (void)self.start_link();
-            return kUnknown;
-        }
-        if(self.ph_ == phase::wait_block0)
-        {
-            (void)self.drive_block0();
-            return kUnknown;
-        }
-        self.throw_if_ended();
-        if(self.ph_ == phase::finished)
-            return 0;
+        self.link_retry_count_ = 0;
+        self.last_link_tick_ = self.clock_value();
+        self.progressed_ = false;
 
-        auto r = self.read_frame();
-        switch(r)
+        for(;;)
         {
-        case read_result::pending:
-        case read_result::error:
-        case read_result::duplicate:
-            return kUnknown;
-        case read_result::cancelled:
-            self.send_cancel();
-            self.ph_ = phase::finished;
-            self.end_ = end_state::cancelled;
-            throw cancelled{};
-        case read_result::eot:
-            self.put_byte(ACK);
-            self.ph_ = phase::finished;
-            if(self.filesize_ != kUnknown && self.received_ < self.filesize_)
+            if(self.try_link())
+                return;
+            self.throw_if_ended();
+
+            if(self.progressed_)
             {
-                self.end_ = end_state::failed;
-                throw failed{};
+                self.progressed_ = false;
+                self.link_retry_count_ = 0;
+                self.last_link_tick_ = self.clock_value();
             }
-            return 0;
-        case read_result::ok:
-            break;
+
+            if(self.link_retry_interval.count() <= 0)
+            {
+                self.sleep_for(poll_interval);
+                continue;
+            }
+
+            auto now = self.clock_value();
+            if(self.timeout_expired(self.last_link_tick_, self.link_retry_interval))
+            {
+                self.retry_link();
+                self.last_link_tick_ = now;
+                auto max_retries = self.link_retries == 0 ? 1u : self.link_retries;
+                if(++self.link_retry_count_ >= max_retries)
+                {
+                    self.send_cancel();
+                    self.ph_ = phase::finished;
+                    self.end_ = end_state::timeout;
+                    throw timeout{};
+                }
+            }
+            self.sleep_for(poll_interval);
         }
-
-        std::size_t data_len = self.body_len_ - CRC_SIZE;
-        std::span<const std::byte> payload{self.body_.data(), data_len};
-        std::size_t deliver = payload.size();
-        if(self.filesize_ != kUnknown)
-            deliver = std::min(deliver, self.filesize_ - self.received_);
-
-        // 先消费帧再回调：回调抛异常时不会把同一帧再交付一次，也不回 ACK，
-        // 发送方会重发该帧。
-        self.reset_frame();
-        if(deliver != 0)
-            self.deliver_bytes(f, payload.data(), deliver);
-        if(self.filesize_ != kUnknown)
-            self.received_ += deliver;
-        self.data_started_ = true;
-        self.expected_seq_ = static_cast<std::uint8_t>(self.expected_seq_ + 1);
-        self.put_byte(ACK);
-
-        if(self.filesize_ != kUnknown && self.received_ >= self.filesize_)
-        {
-            self.ph_ = phase::awaiting_eot;
-            return kUnknown;
-        }
-        if(self.filesize_ == kUnknown)
-            return kUnknown;
-        return self.filesize_ - self.received_;
     }
 
-    // ---- 完成 YMODEM 批处理结束握手 ----
-    // 在 receive() 返回 0 且未中止后调用，非阻塞轮询：
-    // 第一次调用发 'C'，收到空 Block 0 并 ACK 后返回 true。
-    // 发送方还有下一个文件（非空 Block 0）时发 CAN 并抛 failed。
-    bool finish_batch(this auto &&self)
+    // ---- 接收（非阻塞单次处理，不抛 timeout） ----
+    template<typename T>
+    int try_receive(this auto &&self, std::span<const T> &data)
+        requires(is_data_element<T>)
+    {
+        data = {};
+        return receive_result(self.try_receive_impl([&](const std::byte *p, std::size_t n)
+        {
+            data = std::span<const T>{reinterpret_cast<const T *>(p), n};
+        }));
+    }
+
+    template<typename F>
+    int try_receive(this auto &&self, F &&f)
+        requires(is_consumer<F>)
+    {
+        return receive_result(self.try_receive_impl([&](const std::byte *p, std::size_t n)
+        {
+            deliver_bytes(f, p, n);
+        }));
+    }
+
+    // ---- 阻塞接收；至少交付一段非空数据或文件结束 ----
+    template<typename T>
+    int receive(this auto &&self, std::span<const T> &data)
+        requires(is_data_element<T>)
+    {
+        data = {};
+        return self.receive_impl([&](const std::byte *p, std::size_t n)
+        {
+            data = std::span<const T>{reinterpret_cast<const T *>(p), n};
+        });
+    }
+
+    template<typename F>
+    int receive(this auto &&self, F &&f)
+        requires(is_consumer<F>)
+    {
+        return self.receive_impl([&](const std::byte *p, std::size_t n)
+        {
+            deliver_bytes(f, p, n);
+        });
+    }
+
+    // ---- 批处理结束握手（非阻塞单次处理，不抛 timeout） ----
+    bool try_finish_batch(this auto &&self)
     {
         if(self.ph_ != phase::finished)
             return false;
-        self.throw_if_ended();
+        if(self.end_ == end_state::timeout)
+            return false;
+        self.throw_if_ended_except_timeout();
 
         if(self.batch_ == batch_state::done)
             return true;
@@ -232,7 +328,6 @@ public:
             self.end_ = end_state::cancelled;
             throw cancelled{};
         case read_result::eot:
-            // EOT ACK 丢失后发送方重发 EOT：再 ACK 并补发 'C'。
             self.put_byte(ACK);
             self.put_byte(CRC_REQ);
             return false;
@@ -255,6 +350,53 @@ public:
         self.send_cancel();
         self.end_ = end_state::failed;
         throw failed{};
+    }
+
+    // ---- 阻塞完成批处理结束握手；超时发 CAN 并抛 timeout ----
+    void finish_batch(this auto &&self)
+    {
+        if(self.ph_ != phase::finished)
+            throw failed{};
+        self.throw_if_ended();
+
+        self.receive_retry_count_ = 0;
+        self.last_rx_tick_ = self.clock_value();
+        self.progressed_ = false;
+
+        for(;;)
+        {
+            if(self.try_finish_batch())
+                return;
+            self.throw_if_ended();
+
+            if(self.progressed_)
+            {
+                self.progressed_ = false;
+                self.receive_retry_count_ = 0;
+                self.last_rx_tick_ = self.clock_value();
+            }
+
+            if(self.receive_retry_interval.count() <= 0)
+            {
+                self.sleep_for(poll_interval);
+                continue;
+            }
+
+            auto now = self.clock_value();
+            if(self.timeout_expired(self.last_rx_tick_, self.receive_retry_interval))
+            {
+                self.retry_link();
+                self.last_rx_tick_ = now;
+                auto max_retries = self.receive_retries == 0 ? 1u : self.receive_retries;
+                if(++self.receive_retry_count_ >= max_retries)
+                {
+                    self.send_cancel();
+                    self.end_ = end_state::timeout;
+                    throw timeout{};
+                }
+            }
+            self.sleep_for(poll_interval);
+        }
     }
 
     // ---- 本地用户按 Ctrl+C 时调用：向发送方发 CAN，并抛 cancelled ----
@@ -281,12 +423,11 @@ public:
         filename_.clear();
         filesize_ = kUnknown;
         received_ = 0;
+        last_link_tick_ = 0;
+        link_retry_count_ = 0;
         last_rx_tick_ = 0;
-        timeout_count_ = 0;
-        retry_pending_ = false;
-        last_c_tick_ = 0;
-        c_retry_count_ = 0;
-        block0_heard_ = false;
+        receive_retry_count_ = 0;
+        progressed_ = false;
     }
 
 private:
@@ -331,6 +472,13 @@ private:
         done
     };
 
+    struct receive_step
+    {
+        std::size_t countdown = 0; // 本次调用开始前的剩余文件字节数
+        bool delivered = false;
+        bool done = false;
+    };
+
     phase ph_ = phase::idle;
     end_state end_ = end_state::none;
     batch_state batch_ = batch_state::none;
@@ -347,17 +495,16 @@ private:
     std::size_t body_pos_ = 0;
     std::size_t body_len_ = 0;
 
+    std::chrono::milliseconds link_retry_interval{1000};
+    std::uint32_t link_retries = 30;
+    std::chrono::milliseconds receive_retry_interval{1000};
+    std::uint32_t receive_retries = 3;
+
+    std::uint64_t last_link_tick_ = 0;
+    std::uint32_t link_retry_count_ = 0;
     std::uint64_t last_rx_tick_ = 0;
-    std::uint32_t timeout_ms_ = 1000;
-    std::uint32_t timeout_count_ = 0;
-    bool retry_pending_ = false;
-
-    // Block 0 握手阶段：完全没收到字节时周期性重发 'C'。
-    std::uint64_t last_c_tick_ = 0;
-    std::uint32_t c_retry_count_ = 0;
-    bool block0_heard_ = false;
-
-    static constexpr std::uint32_t MAX_TIMEOUTS = 3;
+    std::uint32_t receive_retry_count_ = 0;
+    bool progressed_ = false;
 
     int get_byte(this auto &&self)
     {
@@ -380,57 +527,29 @@ private:
         return static_cast<std::uint64_t>(static_cast<U>(self.time()));
     }
 
-    bool timeout_expired(this auto &&self, std::uint64_t last_tick)
+    bool timeout_expired(this auto &&self, std::uint64_t last_tick,
+                         std::chrono::milliseconds timeout)
     {
         using T = std::remove_cvref_t<decltype(self.time())>;
         using U = std::make_unsigned_t<T>;
         auto now = static_cast<U>(self.clock_value());
         auto last = static_cast<U>(last_tick);
-        return static_cast<U>(now - last) >= static_cast<U>(self.timeout_ms_);
+        return static_cast<U>(now - last) >=
+               static_cast<U>(timeout.count());
     }
 
-    void check_timeout(this auto &&self)
+    std::size_t remaining() const
     {
-        if(self.timeout_ms_ == 0)
-            return;
-        bool partial = self.hdr_pos_ > 0 || self.body_pos_ > 0;
-        if(!partial && !self.retry_pending_)
-            return;
-        if(!self.timeout_expired(self.last_rx_tick_))
-            return;
-
-        self.put_byte(NAK);
-        if(partial)
-            self.reset_frame();
-        self.retry_pending_ = true;
-        self.last_rx_tick_ = self.clock_value();
-        if(++self.timeout_count_ >= MAX_TIMEOUTS)
-        {
-            self.send_cancel();
-            self.ph_ = phase::finished;
-            self.end_ = end_state::timeout;
-            throw timeout{};
-        }
+        return filesize_ - received_;
     }
 
-    void check_block0_timeout(this auto &&self)
+    static int receive_result(const receive_step &step)
     {
-        if(self.timeout_ms_ == 0 || self.block0_heard_)
-            return;
-        if(self.hdr_pos_ != 0 || self.body_pos_ != 0)
-            return;
-        if(!self.timeout_expired(self.last_c_tick_))
-            return;
-
-        self.put_byte(CRC_REQ);
-        self.last_c_tick_ = self.clock_value();
-        if(++self.c_retry_count_ >= MAX_TIMEOUTS)
-        {
-            self.send_cancel();
-            self.ph_ = phase::finished;
-            self.end_ = end_state::timeout;
-            throw timeout{};
-        }
+        if(step.delivered)
+            return static_cast<int>(step.countdown);
+        if(step.done)
+            return 0;
+        return -1;
     }
 
     template<typename F>
@@ -475,10 +594,36 @@ private:
             throw failed{};
     }
 
+    void throw_if_ended_except_timeout() const
+    {
+        if(end_ == end_state::cancelled)
+            throw cancelled{};
+        if(end_ == end_state::failed)
+            throw failed{};
+    }
+
     void send_cancel(this auto &&self)
     {
         for(int i = 0; i < CAN_BURST; ++i)
             self.put_byte(CAN);
+    }
+
+    void retry_link(this auto &&self)
+    {
+        if(self.hdr_pos_ != 0 || self.body_pos_ != 0)
+        {
+            self.put_byte(NAK);
+            self.reset_frame();
+            return;
+        }
+        self.put_byte(CRC_REQ);
+    }
+
+    void retry_receive(this auto &&self)
+    {
+        self.put_byte(NAK);
+        if(self.hdr_pos_ != 0 || self.body_pos_ != 0)
+            self.reset_frame();
     }
 
     static std::uint16_t crc16(std::span<const std::byte> data)
@@ -530,27 +675,12 @@ private:
 
     read_result read_frame(this auto &&self)
     {
-        bool got = false;
         while(self.hdr_pos_ < HDR_SIZE)
         {
             int c = self.get_byte();
             if(c < 0)
-            {
-                if(got)
-                {
-                    self.last_rx_tick_ = self.clock_value();
-                    self.timeout_count_ = 0;
-                    self.retry_pending_ = false;
-                }
-                else
-                    self.check_timeout();
                 return read_result::pending;
-            }
-            got = true;
-            if(self.ph_ == phase::wait_block0)
-                self.block0_heard_ = true;
-            self.timeout_count_ = 0;
-            self.retry_pending_ = false;
+            self.progressed_ = true;
             self.hdr_[self.hdr_pos_++] = static_cast<std::uint8_t>(c);
 
             // EOT/CAN 是单字节信号，必须在帧头首字节立即判断。
@@ -584,22 +714,8 @@ private:
         {
             int c = self.get_byte();
             if(c < 0)
-            {
-                if(got)
-                {
-                    self.last_rx_tick_ = self.clock_value();
-                    self.timeout_count_ = 0;
-                    self.retry_pending_ = false;
-                }
-                else
-                    self.check_timeout();
                 return read_result::pending;
-            }
-            got = true;
-            if(self.ph_ == phase::wait_block0)
-                self.block0_heard_ = true;
-            self.timeout_count_ = 0;
-            self.retry_pending_ = false;
+            self.progressed_ = true;
             self.body_[self.body_pos_++] = static_cast<std::byte>(c);
         }
 
@@ -639,8 +755,6 @@ private:
         switch(r)
         {
         case read_result::pending:
-            self.check_block0_timeout();
-            return false;
         case read_result::error:
         case read_result::duplicate:
             return false;
@@ -672,11 +786,145 @@ private:
             throw failed{};
         }
 
+        // 不再支持未知文件大小；没有大小时直接中止。
+        if(self.filesize_ == kUnknown)
+        {
+            self.send_cancel();
+            self.ph_ = phase::finished;
+            self.end_ = end_state::failed;
+            throw failed{};
+        }
+
+        // 返回值为 int，文件总长必须能放进正数倒计时。
+        if(self.filesize_ >
+           static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        {
+            self.send_cancel();
+            self.ph_ = phase::finished;
+            self.end_ = end_state::failed;
+            throw failed{};
+        }
+
         self.expected_seq_ = 1;
         self.ph_ = phase::data_phase;
         self.put_byte(ACK);
         self.put_byte(CRC_REQ);
         return true;
+    }
+
+    template<typename Deliver>
+    receive_step try_receive_impl(this auto &&self, Deliver &&deliver)
+    {
+        switch(self.ph_)
+        {
+        case phase::idle:
+        case phase::wait_block0:
+            throw failed{};
+        case phase::finished:
+            if(self.end_ == end_state::timeout)
+                return {self.remaining(), false, false};
+            self.throw_if_ended_except_timeout();
+            return {0, false, true};
+        case phase::data_phase:
+        case phase::awaiting_eot:
+            break;
+        }
+
+        std::size_t countdown = self.remaining();
+        auto r = self.read_frame();
+        switch(r)
+        {
+        case read_result::pending:
+        case read_result::error:
+        case read_result::duplicate:
+            return {countdown, false, false};
+        case read_result::cancelled:
+            self.send_cancel();
+            self.ph_ = phase::finished;
+            self.end_ = end_state::cancelled;
+            throw cancelled{};
+        case read_result::eot:
+            self.put_byte(ACK);
+            self.ph_ = phase::finished;
+            if(self.received_ < self.filesize_)
+            {
+                self.end_ = end_state::failed;
+                throw failed{};
+            }
+            return {0, false, true};
+        case read_result::ok:
+            break;
+        }
+
+        std::size_t data_len = self.body_len_ - CRC_SIZE;
+        std::span<const std::byte> payload{self.body_.data(), data_len};
+        std::size_t deliver_len =
+            std::min(data_len, self.filesize_ - self.received_);
+
+        // 先消费帧再回调：回调抛异常时不会把同一帧再交付一次，也不回 ACK，
+        // 发送方会重发该帧。
+        self.reset_frame();
+        if(deliver_len != 0)
+            deliver(payload.data(), deliver_len);
+        self.received_ += deliver_len;
+        self.data_started_ = true;
+        self.expected_seq_ = static_cast<std::uint8_t>(self.expected_seq_ + 1);
+        self.put_byte(ACK);
+
+        if(self.received_ >= self.filesize_)
+            self.ph_ = phase::awaiting_eot;
+        return {countdown, deliver_len != 0, false};
+    }
+
+    template<typename Deliver>
+    int receive_impl(this auto &&self, Deliver &&deliver)
+    {
+        if(self.ph_ == phase::idle || self.ph_ == phase::wait_block0)
+            throw failed{};
+        self.throw_if_ended();
+
+        self.receive_retry_count_ = 0;
+        self.last_rx_tick_ = self.clock_value();
+        self.progressed_ = false;
+
+        for(;;)
+        {
+            auto step = self.try_receive_impl(deliver);
+            if(step.delivered)
+                return static_cast<int>(step.countdown);
+            if(step.done)
+                return 0;
+            self.throw_if_ended();
+
+            if(self.progressed_)
+            {
+                self.progressed_ = false;
+                self.receive_retry_count_ = 0;
+                self.last_rx_tick_ = self.clock_value();
+            }
+
+            if(self.receive_retry_interval.count() <= 0)
+            {
+                self.sleep_for(poll_interval);
+                continue;
+            }
+
+            auto now = self.clock_value();
+            if(self.timeout_expired(self.last_rx_tick_, self.receive_retry_interval))
+            {
+                self.retry_receive();
+                self.last_rx_tick_ = now;
+                auto max_retries = self.receive_retries == 0 ? 1u : self.receive_retries;
+                if(++self.receive_retry_count_ >= max_retries)
+                {
+                    self.send_cancel();
+                    self.ph_ = phase::finished;
+                    self.end_ = end_state::timeout;
+                    throw timeout{};
+                }
+            }
+            self.sleep_for(poll_interval);
+        }
     }
 };
 

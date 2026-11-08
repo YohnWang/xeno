@@ -27,12 +27,30 @@ namespace xeno
 //   std::int64_t time() const;              // 默认 steady_clock，毫秒
 //   sleep_for(std::chrono::duration);       // 默认 this_thread::sleep_for
 // 通过 deducing this + 继承在编译期绑定，不检查返回值以外的 IO 状态。
-// 半帧长时间无新字节时类内发 ZNAK/ZRPOS 重试，连续失败抛 timeout；
-// 握手阶段超时仍由调用方处理。
+// try_link()/try_receive()/try_finish_batch() 非阻塞；
+// link()/receive()/finish_batch() 阻塞并处理重试与超时。
 //
 // 所有文件内容都按原始二进制交付，不做 CR/LF 或字符集转换。
 class zmodem_receiver
 {
+    template<typename F>
+    static constexpr bool is_consumer =
+        std::invocable<F &, std::span<const std::byte>>
+        || std::invocable<F &, const std::byte *, std::size_t>
+        || std::invocable<F &, std::span<const std::uint8_t>>
+        || std::invocable<F &, const std::uint8_t *, std::size_t>
+        || std::invocable<F &, std::span<const char>>
+        || std::invocable<F &, const char *, std::size_t>
+        || std::invocable<F &, std::span<const std::int8_t>>
+        || std::invocable<F &, const std::int8_t *, std::size_t>;
+
+    template<typename T>
+    static constexpr bool is_data_element =
+        std::same_as<T, std::byte> || std::same_as<T, std::uint8_t>
+        || std::same_as<T, char> || std::same_as<T, std::int8_t>;
+
+    static constexpr std::chrono::milliseconds poll_interval{10};
+
 public:
     static constexpr std::size_t kUnknown = std::numeric_limits<std::size_t>::max();
 
@@ -43,7 +61,7 @@ public:
         std::size_t resume_offset = 0;
     };
 
-    // 传输非正常结束。start_link()/receive()/finish_batch() 在终止状态下抛出。
+    // 传输非正常结束。link()/receive()/finish_batch() 在终止状态下抛出。
     struct error : std::exception
     {
         const char *what() const noexcept override
@@ -70,7 +88,7 @@ public:
         }
     };
 
-    // 半帧长时间无新字节，且重试耗尽。
+    // 阻塞接口重试耗尽。
     struct timeout : failed
     {
         const char *what() const noexcept override
@@ -96,52 +114,342 @@ public:
         return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
     }
 
-    // 可配置延时接口；本类内部不会调用，供调用方或派生类使用。
+    // 可配置延时接口；link()/receive()/finish_batch() 使用它。
     template<typename Rep, typename Period>
     void sleep_for(const std::chrono::duration<Rep, Period> &d)
     {
         std::this_thread::sleep_for(d);
     }
 
-    // 半帧无进展超时（毫秒）；0 关闭，默认 1000ms。
-    void set_timeout(std::uint32_t ms)
+    // 单参数：总时长，使用当前 retry interval 计算重试次数；
+    // 双参数：单次重试间隔 + 重试次数。
+    template<typename Rep, typename Period>
+    void set_link_timeout(this auto &&self,
+                          const std::chrono::duration<Rep, Period> &total)
     {
-        timeout_ms_ = ms;
+        using namespace std::chrono;
+        auto total_ms = duration_cast<milliseconds>(total).count();
+        if(total_ms <= 0)
+        {
+            self.link_retry_interval = milliseconds{0};
+            self.link_retries = 0;
+            return;
+        }
+        if(self.link_retry_interval.count() <= 0)
+            self.link_retry_interval = milliseconds{1000};
+        auto interval_ms = self.link_retry_interval.count();
+        auto retries = (static_cast<std::uint64_t>(total_ms) +
+                        static_cast<std::uint64_t>(interval_ms) - 1) /
+                       static_cast<std::uint64_t>(interval_ms);
+        self.link_retries = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(retries,
+                                    std::numeric_limits<std::uint32_t>::max()));
     }
 
-    // ---- 建立连接 ----
-    // true 表示已收到 ZFILE 并发出 ZRPOS；false 表示继续轮询。
-    bool start_link(this auto &&self, const options &opt = {})
+    template<typename Rep, typename Period>
+    void set_link_timeout(this auto &&self,
+                          const std::chrono::duration<Rep, Period> &retry_interval,
+                          std::uint32_t retries)
     {
-        self.check_timeout();
-        self.progressed_ = false;
-        bool r = self.start_link_impl(opt);
-        self.note_progress();
-        return r;
+        self.link_retry_interval =
+            std::chrono::duration_cast<std::chrono::milliseconds>(retry_interval);
+        self.link_retries = retries == 0 ? 1 : retries;
     }
 
-    // ---- 接收当前文件 ----
-    // 返回 0 表示 ZEOF 且文件结束；kUnknown 表示继续；
-    // 其余为剩余待交付字节数（filesize 已知时）。
-    std::size_t receive(this auto &&self, auto &&f)
+    template<typename Rep, typename Period>
+    void set_receive_timeout(this auto &&self,
+                             const std::chrono::duration<Rep, Period> &total)
     {
-        self.check_timeout();
-        self.progressed_ = false;
-        auto r = self.receive_impl(f);
-        self.note_progress();
-        return r;
+        using namespace std::chrono;
+        auto total_ms = duration_cast<milliseconds>(total).count();
+        if(total_ms <= 0)
+        {
+            self.receive_retry_interval = milliseconds{0};
+            self.receive_retries = 0;
+            return;
+        }
+        if(self.receive_retry_interval.count() <= 0)
+            self.receive_retry_interval = milliseconds{1000};
+        auto interval_ms = self.receive_retry_interval.count();
+        auto retries = (static_cast<std::uint64_t>(total_ms) +
+                        static_cast<std::uint64_t>(interval_ms) - 1) /
+                       static_cast<std::uint64_t>(interval_ms);
+        self.receive_retries = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(retries,
+                                    std::numeric_limits<std::uint32_t>::max()));
     }
 
-    // ---- 结束 ZMODEM 批处理 ----
-    // receive() 返回 0 后调用，非阻塞轮询：
-    // 发 ZRINIT，后续文件用 ZSKIP 跳过，收到 ZFIN 并回 ZFIN 后返回 true。
-    bool finish_batch(this auto &&self)
+    template<typename Rep, typename Period>
+    void set_receive_timeout(this auto &&self,
+                             const std::chrono::duration<Rep, Period> &retry_interval,
+                             std::uint32_t retries)
     {
-        self.check_timeout();
+        self.receive_retry_interval =
+            std::chrono::duration_cast<std::chrono::milliseconds>(retry_interval);
+        self.receive_retries = retries == 0 ? 1 : retries;
+    }
+
+    // ---- 建立连接（非阻塞单次处理，不抛 timeout） ----
+    bool try_link(this auto &&self, const options &opt = {})
+    {
+        switch(self.ph_)
+        {
+        case phase::idle:
+            self.opt_ = opt;
+            self.send_zrinit();
+            self.last_link_tick_ = self.clock_value();
+            self.link_retry_count_ = 0;
+            self.progressed_ = false;
+            self.ph_ = phase::wait_file;
+            self.sub_ = sub_purpose::none;
+            self.data_active_ = false;
+            self.discard_ = false;
+            self.reset_parser();
+            self.reset_data();
+            return false;
+        case phase::wait_file:
+            if(self.sub_ != sub_purpose::none)
+                return self.drive_sub();
+            return self.drive_wait_file();
+        case phase::data:
+            return true;
+        case phase::file_done:
+        case phase::done:
+            if(self.end_ == end_state::timeout)
+                return false;
+            self.throw_if_ended_except_timeout();
+            return true;
+        }
+        return true;
+    }
+
+    // ---- 阻塞建立连接；超时发 CAN 并抛 timeout ----
+    void link(this auto &&self, const options &opt = {})
+    {
+        self.link_retry_count_ = 0;
+        self.last_link_tick_ = self.clock_value();
         self.progressed_ = false;
-        bool r = self.finish_batch_impl();
-        self.note_progress();
-        return r;
+
+        for(;;)
+        {
+            if(self.try_link(opt))
+                return;
+            self.throw_if_ended();
+
+            if(self.progressed_)
+            {
+                self.progressed_ = false;
+                self.link_retry_count_ = 0;
+                self.last_link_tick_ = self.clock_value();
+            }
+
+            if(self.link_retry_interval.count() <= 0)
+            {
+                self.sleep_for(poll_interval);
+                continue;
+            }
+
+            auto now = self.clock_value();
+            if(self.timeout_expired(self.last_link_tick_, self.link_retry_interval))
+            {
+                self.retry_link();
+                self.last_link_tick_ = now;
+                auto max_retries = self.link_retries == 0 ? 1u : self.link_retries;
+                if(++self.link_retry_count_ >= max_retries)
+                {
+                    self.send_cancel();
+                    self.ph_ = phase::done;
+                    self.end_ = end_state::timeout;
+                    throw timeout{};
+                }
+            }
+            self.sleep_for(poll_interval);
+        }
+    }
+
+    // ---- 接收（非阻塞单次处理，不抛 timeout） ----
+    template<typename T>
+    int try_receive(this auto &&self, std::span<const T> &data)
+        requires(is_data_element<T>)
+    {
+        data = {};
+        return receive_result(self.try_receive_impl([&](const std::byte *p, std::size_t n)
+        {
+            data = std::span<const T>{reinterpret_cast<const T *>(p), n};
+        }));
+    }
+
+    template<typename F>
+    int try_receive(this auto &&self, F &&f)
+        requires(is_consumer<F>)
+    {
+        return receive_result(self.try_receive_impl([&](const std::byte *p, std::size_t n)
+        {
+            deliver_bytes(f, p, n);
+        }));
+    }
+
+    // ---- 阻塞接收；至少交付一段非空数据或文件结束 ----
+    template<typename T>
+    int receive(this auto &&self, std::span<const T> &data)
+        requires(is_data_element<T>)
+    {
+        data = {};
+        return self.receive_impl([&](const std::byte *p, std::size_t n)
+        {
+            data = std::span<const T>{reinterpret_cast<const T *>(p), n};
+        });
+    }
+
+    template<typename F>
+    int receive(this auto &&self, F &&f)
+        requires(is_consumer<F>)
+    {
+        return self.receive_impl([&](const std::byte *p, std::size_t n)
+        {
+            deliver_bytes(f, p, n);
+        });
+    }
+
+    // ---- 批处理结束握手（非阻塞单次处理，不抛 timeout） ----
+    bool try_finish_batch(this auto &&self)
+    {
+        if(self.end_ == end_state::timeout)
+            return false;
+        self.throw_if_ended_except_timeout();
+
+        if(self.ph_ == phase::done)
+            return true;
+        if(self.ph_ != phase::file_done)
+            return false;
+
+        if(!self.batch_started_)
+        {
+            self.send_zrinit();
+            self.batch_started_ = true;
+            return false;
+        }
+
+        if(self.sub_ != sub_purpose::none)
+        {
+            (void)self.drive_sub();
+            return false;
+        }
+
+        header h;
+        auto r = self.poll_header(h);
+        switch(r)
+        {
+        case hdr_status::pending:
+            return false;
+        case hdr_status::cancelled:
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::cancelled;
+            throw cancelled{};
+        case hdr_status::error:
+            self.send_position_header(ZNAK, 0);
+            return false;
+        case hdr_status::ok:
+            break;
+        }
+
+        switch(h.type)
+        {
+        case ZFILE:
+            self.sub_ = sub_purpose::skip;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
+            return false;
+        case ZSINIT:
+            self.sub_ = sub_purpose::sinit;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
+            return false;
+        case ZSTDERR:
+            self.sub_ = sub_purpose::discard;
+            self.data_active_ = true;
+            self.data_32_ = h.crc32;
+            self.reset_data();
+            return false;
+        case ZFIN:
+            self.send_position_header(ZFIN, 0);
+            self.ph_ = phase::done;
+            return true;
+        case ZRQINIT:
+            self.send_zrinit();
+            return false;
+        case ZEOF:
+            self.send_zrinit();
+            return false;
+        case ZCAN:
+        case ZABORT:
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::cancelled;
+            throw cancelled{};
+        case ZFERR:
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
+            throw failed{};
+        case ZCOMMAND:
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
+            throw failed{};
+        default:
+            return false;
+        }
+    }
+
+    // ---- 阻塞完成批处理结束握手；超时发 CAN 并抛 timeout ----
+    void finish_batch(this auto &&self)
+    {
+        if(self.ph_ != phase::file_done && self.ph_ != phase::done)
+            throw failed{};
+        self.throw_if_ended();
+
+        self.receive_retry_count_ = 0;
+        self.last_rx_tick_ = self.clock_value();
+        self.progressed_ = false;
+
+        for(;;)
+        {
+            if(self.try_finish_batch())
+                return;
+            self.throw_if_ended();
+
+            if(self.progressed_)
+            {
+                self.progressed_ = false;
+                self.receive_retry_count_ = 0;
+                self.last_rx_tick_ = self.clock_value();
+            }
+
+            if(self.receive_retry_interval.count() <= 0)
+            {
+                self.sleep_for(poll_interval);
+                continue;
+            }
+
+            auto now = self.clock_value();
+            if(self.timeout_expired(self.last_rx_tick_, self.receive_retry_interval))
+            {
+                self.retry_link();
+                self.last_rx_tick_ = now;
+                auto max_retries = self.receive_retries == 0 ? 1u : self.receive_retries;
+                if(++self.receive_retry_count_ >= max_retries)
+                {
+                    self.send_cancel();
+                    self.ph_ = phase::done;
+                    self.end_ = end_state::timeout;
+                    throw timeout{};
+                }
+            }
+            self.sleep_for(poll_interval);
+        }
     }
 
     // ---- 本地用户按 Ctrl+C 时调用：发 CAN 串并抛 cancelled ----
@@ -163,10 +471,10 @@ public:
         batch_started_ = false;
         data_active_ = false;
         discard_ = false;
+        last_link_tick_ = 0;
+        link_retry_count_ = 0;
         last_rx_tick_ = 0;
-        timeout_count_ = 0;
-        retry_pending_ = false;
-        retry_zrpos_ = false;
+        receive_retry_count_ = 0;
         progressed_ = false;
         reset_data();
         reset_parser();
@@ -332,13 +640,23 @@ private:
     bool hex_lf_ = false;
     int pushback_ = -1;
 
+    std::chrono::milliseconds link_retry_interval{1000};
+    std::uint32_t link_retries = 30;
+    std::chrono::milliseconds receive_retry_interval{1000};
+    std::uint32_t receive_retries = 3;
+
+    std::uint64_t last_link_tick_ = 0;
+    std::uint32_t link_retry_count_ = 0;
     std::uint64_t last_rx_tick_ = 0;
-    std::uint32_t timeout_ms_ = 1000;
-    std::uint32_t timeout_count_ = 0;
-    bool retry_pending_ = false;
-    bool retry_zrpos_ = false;
+    std::uint32_t receive_retry_count_ = 0;
     bool progressed_ = false;
-    static constexpr std::uint32_t MAX_TIMEOUTS = 3;
+
+    struct receive_step
+    {
+        std::size_t countdown = 0; // 本次调用开始前的剩余文件字节数
+        bool delivered = false;
+        bool done = false;
+    };
 
     int get_byte(this auto &&self)
     {
@@ -371,44 +689,48 @@ private:
         return static_cast<std::uint64_t>(static_cast<U>(self.time()));
     }
 
-    bool timeout_expired(this auto &&self)
+    bool timeout_expired(this auto &&self, std::uint64_t last_tick,
+                         std::chrono::milliseconds timeout)
     {
         using T = std::remove_cvref_t<decltype(self.time())>;
         using U = std::make_unsigned_t<T>;
         auto now = static_cast<U>(self.clock_value());
-        auto last = static_cast<U>(self.last_rx_tick_);
-        return static_cast<U>(now - last) >= static_cast<U>(self.timeout_ms_);
+        auto last = static_cast<U>(last_tick);
+        return static_cast<U>(now - last) >=
+               static_cast<U>(timeout.count());
     }
 
-    void note_progress(this auto &&self)
+    void retry_link(this auto &&self)
     {
-        if(self.progressed_)
+        if(self.hs_ != hdr_state::search)
         {
-            self.last_rx_tick_ = self.clock_value();
-            self.timeout_count_ = 0;
-            self.retry_pending_ = false;
-            self.progressed_ = false;
+            self.send_position_header(ZNAK, 0);
+            self.reset_parser();
+            return;
         }
+        if(self.sub_ != sub_purpose::none || self.data_active_)
+        {
+            self.send_position_header(ZNAK, 0);
+            self.clear_data();
+            return;
+        }
+        self.send_zrinit();
     }
 
-    void check_timeout(this auto &&self)
+    void retry_receive(this auto &&self)
     {
-        if(self.timeout_ms_ == 0 || self.ph_ == phase::done)
+        if(self.hs_ != hdr_state::search)
+        {
+            self.send_position_header(ZNAK, 0);
+            self.reset_parser();
             return;
-        bool partial_header = self.hs_ != hdr_state::search;
-        bool partial_data = self.data_active_;
-        if(!partial_header && !partial_data && !self.retry_pending_)
-            return;
-        if(!self.timeout_expired())
-            return;
-
-        if(partial_data)
+        }
+        if(self.data_active_)
         {
             if(self.sub_ != sub_purpose::none)
             {
                 self.send_position_header(ZNAK, 0);
                 self.clear_data();
-                self.retry_zrpos_ = false;
             }
             else
             {
@@ -416,29 +738,16 @@ private:
                 self.data_active_ = false;
                 self.discard_ = false;
                 self.reset_data();
-                self.retry_zrpos_ = true;
             }
+            return;
         }
-        else if(partial_header)
+        if(self.sub_ != sub_purpose::none)
         {
             self.send_position_header(ZNAK, 0);
-            self.reset_parser();
-            self.retry_zrpos_ = false;
+            self.clear_data();
+            return;
         }
-        else if(self.retry_zrpos_)
-            self.send_position_header(ZRPOS, self.received_);
-        else
-            self.send_position_header(ZNAK, 0);
-
-        self.retry_pending_ = true;
-        self.last_rx_tick_ = self.clock_value();
-        if(++self.timeout_count_ >= MAX_TIMEOUTS)
-        {
-            self.send_cancel();
-            self.ph_ = phase::done;
-            self.end_ = end_state::timeout;
-            throw timeout{};
-        }
+        self.send_position_header(ZRPOS, self.received_);
     }
 
     template<typename F>
@@ -474,6 +783,14 @@ private:
             throw cancelled{};
         if(end_ == end_state::timeout)
             throw timeout{};
+        if(end_ == end_state::failed)
+            throw failed{};
+    }
+
+    void throw_if_ended_except_timeout() const
+    {
+        if(end_ == end_state::cancelled)
+            throw cancelled{};
         if(end_ == end_state::failed)
             throw failed{};
     }
@@ -983,8 +1300,27 @@ private:
     {
         self.parse_file_info();
 
+        // 不再支持未知文件大小；没有大小时直接中止。
+        if(self.filesize_ == kUnknown)
+        {
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
+            throw failed{};
+        }
+
+        // 返回值为 int，文件总长必须能放进正数倒计时。
+        if(self.filesize_ >
+           static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        {
+            self.send_cancel();
+            self.ph_ = phase::done;
+            self.end_ = end_state::failed;
+            throw failed{};
+        }
+
         std::size_t offset = self.opt_.resume_offset;
-        if(self.filesize_ != kUnknown && offset > self.filesize_)
+        if(offset > self.filesize_)
             offset = 0;
         self.received_ = offset;
         self.send_position_header(ZRPOS, self.received_);
@@ -1126,12 +1462,19 @@ private:
 
     std::size_t remaining() const
     {
-        if(filesize_ == kUnknown || received_ >= filesize_)
-            return kUnknown;
-        return filesize_ - received_;
+        return received_ < filesize_ ? filesize_ - received_ : 0;
     }
 
-    bool drive_data(this auto &&self, auto &&f)
+    static int receive_result(const receive_step &step)
+    {
+        if(step.delivered)
+            return static_cast<int>(step.countdown);
+        if(step.done)
+            return 0;
+        return -1;
+    }
+
+    bool drive_data(this auto &&self, auto &&deliver)
     {
         std::uint8_t end;
         auto r = self.poll_data(end);
@@ -1167,14 +1510,15 @@ private:
             return false;
         }
 
-        std::size_t deliver = self.data_len_;
-        if(self.filesize_ != kUnknown && self.received_ < self.filesize_)
-            deliver = std::min(deliver, self.filesize_ - self.received_);
-        else if(self.filesize_ != kUnknown)
-            deliver = 0;
+        std::size_t deliver_len = self.data_len_;
+        if(self.received_ < self.filesize_)
+            deliver_len = std::min(deliver_len, self.filesize_ - self.received_);
+        else
+            deliver_len = 0;
 
-        if(deliver != 0)
-            self.deliver_bytes(f, self.buf_.data(), deliver);
+        bool delivered = deliver_len != 0;
+        if(delivered)
+            deliver(self.buf_.data(), deliver_len);
         self.received_ += self.data_len_;
 
         if(end == ZCRCQ)
@@ -1189,37 +1533,42 @@ private:
         // ZCRCG: 继续读下一个子包
 
         self.reset_data();
-        return false;
+        return delivered;
     }
 
-    std::size_t receive_impl(this auto &&self, auto &&f)
+    template<typename Deliver>
+    receive_step try_receive_impl(this auto &&self, Deliver &&deliver)
     {
-        if(self.ph_ == phase::idle)
+        switch(self.ph_)
         {
-            (void)self.start_link_impl(options{});
-            return kUnknown;
+        case phase::idle:
+        case phase::wait_file:
+            throw failed{};
+        case phase::file_done:
+        case phase::done:
+            if(self.end_ == end_state::timeout)
+                return {self.remaining(), false, false};
+            self.throw_if_ended_except_timeout();
+            return {self.remaining(), false, true};
+        case phase::data:
+            break;
         }
-        if(self.ph_ == phase::wait_file)
-        {
-            (void)self.start_link_impl(self.opt_);
-            return kUnknown;
-        }
-        self.throw_if_ended();
-        if(self.ph_ == phase::file_done || self.ph_ == phase::done)
-            return 0;
-        if(self.ph_ != phase::data)
-            return kUnknown;
+
+        std::size_t countdown = self.remaining();
+        if(self.end_ == end_state::timeout)
+            return {countdown, false, false};
+        self.throw_if_ended_except_timeout();
 
         if(self.sub_ != sub_purpose::none)
         {
             (void)self.drive_sub();
-            return self.remaining();
+            return {countdown, false, false};
         }
 
         if(self.data_active_)
         {
-            (void)self.drive_data(f);
-            return self.remaining();
+            bool delivered = self.drive_data(deliver);
+            return {countdown, delivered, false};
         }
 
         header h;
@@ -1227,7 +1576,7 @@ private:
         switch(r)
         {
         case hdr_status::pending:
-            return kUnknown;
+            return {countdown, false, false};
         case hdr_status::cancelled:
             self.send_cancel();
             self.ph_ = phase::done;
@@ -1235,7 +1584,7 @@ private:
             throw cancelled{};
         case hdr_status::error:
             self.send_position_header(ZNAK, 0);
-            return kUnknown;
+            return {countdown, false, false};
         case hdr_status::ok:
             break;
         }
@@ -1249,12 +1598,12 @@ private:
             self.data_active_ = true;
             self.data_32_ = h.crc32;
             self.reset_data();
-            return kUnknown;
+            return {countdown, false, false};
         }
         case ZEOF:
             if(position(h) == self.received_)
             {
-                if(self.filesize_ != kUnknown && self.received_ < self.filesize_)
+                if(self.received_ < self.filesize_)
                 {
                     // 声明的文件大小还没收满就 EOF：中止并报告失败。
                     self.send_cancel();
@@ -1263,10 +1612,10 @@ private:
                     throw failed{};
                 }
                 self.ph_ = phase::file_done;
-                return 0;
+                return {0, false, true};
             }
             self.send_position_header(ZRPOS, self.received_);
-            return kUnknown;
+            return {countdown, false, false};
         case ZCAN:
         case ZABORT:
             self.send_cancel();
@@ -1299,131 +1648,66 @@ private:
             self.data_active_ = true;
             self.data_32_ = h.crc32;
             self.reset_data();
-            return kUnknown;
+            return {countdown, false, false};
         case ZFREECNT:
             self.send_position_header(ZACK, 0);
-            return kUnknown;
+            return {countdown, false, false};
         case ZCHALLENGE:
             self.send_position_header(ZACK, position(h));
-            return kUnknown;
+            return {countdown, false, false};
         default:
-            return kUnknown;
+            return {countdown, false, false};
         }
     }
 
-    bool start_link_impl(this auto &&self, const options &opt)
+    template<typename Deliver>
+    int receive_impl(this auto &&self, Deliver &&deliver)
     {
-        switch(self.ph_)
-        {
-        case phase::idle:
-            self.opt_ = opt;
-            self.send_zrinit();
-            self.ph_ = phase::wait_file;
-            self.sub_ = sub_purpose::none;
-            self.data_active_ = false;
-            self.reset_parser();
-            self.reset_data();
-            return false;
-        case phase::wait_file:
-            return self.drive_wait_file();
-        case phase::data:
-            return true;
-        case phase::file_done:
-        case phase::done:
-            self.throw_if_ended();
-            return true;
-        }
-        return true;
-    }
-
-    bool finish_batch_impl(this auto &&self)
-    {
-        if(self.ph_ == phase::done)
-        {
-            self.throw_if_ended();
-            return true;
-        }
-        if(self.ph_ != phase::file_done)
-            return false;
-
-        if(!self.batch_started_)
-        {
-            self.send_zrinit();
-            self.batch_started_ = true;
-            return false;
-        }
-
-        if(self.sub_ != sub_purpose::none)
-        {
-            (void)self.drive_sub();
-            return false;
-        }
-
-        header h;
-        auto r = self.poll_header(h);
-        switch(r)
-        {
-        case hdr_status::pending:
-            return false;
-        case hdr_status::cancelled:
-            self.send_cancel();
-            self.ph_ = phase::done;
-            self.end_ = end_state::cancelled;
-            throw cancelled{};
-        case hdr_status::error:
-            self.send_position_header(ZNAK, 0);
-            return false;
-        case hdr_status::ok:
-            break;
-        }
-
-        switch(h.type)
-        {
-        case ZFILE:
-            self.sub_ = sub_purpose::skip;
-            self.data_active_ = true;
-            self.data_32_ = h.crc32;
-            self.reset_data();
-            return false;
-        case ZSINIT:
-            self.sub_ = sub_purpose::sinit;
-            self.data_active_ = true;
-            self.data_32_ = h.crc32;
-            self.reset_data();
-            return false;
-        case ZSTDERR:
-            self.sub_ = sub_purpose::discard;
-            self.data_active_ = true;
-            self.data_32_ = h.crc32;
-            self.reset_data();
-            return false;
-        case ZFIN:
-            self.send_position_header(ZFIN, 0);
-            self.ph_ = phase::done;
-            return true;
-        case ZRQINIT:
-            self.send_zrinit();
-            return false;
-        case ZEOF:
-            self.send_zrinit();
-            return false;
-        case ZCAN:
-        case ZABORT:
-            self.send_cancel();
-            self.ph_ = phase::done;
-            self.end_ = end_state::cancelled;
-            throw cancelled{};
-        case ZFERR:
-            self.ph_ = phase::done;
-            self.end_ = end_state::failed;
+        if(self.ph_ == phase::idle || self.ph_ == phase::wait_file)
             throw failed{};
-        case ZCOMMAND:
-            self.send_cancel();
-            self.ph_ = phase::done;
-            self.end_ = end_state::failed;
-            throw failed{};
-        default:
-            return false;
+        self.throw_if_ended();
+
+        self.receive_retry_count_ = 0;
+        self.last_rx_tick_ = self.clock_value();
+        self.progressed_ = false;
+
+        for(;;)
+        {
+            auto step = self.try_receive_impl(deliver);
+            if(step.delivered)
+                return static_cast<int>(step.countdown);
+            if(step.done)
+                return 0;
+            self.throw_if_ended();
+
+            if(self.progressed_)
+            {
+                self.progressed_ = false;
+                self.receive_retry_count_ = 0;
+                self.last_rx_tick_ = self.clock_value();
+            }
+
+            if(self.receive_retry_interval.count() <= 0)
+            {
+                self.sleep_for(poll_interval);
+                continue;
+            }
+
+            auto now = self.clock_value();
+            if(self.timeout_expired(self.last_rx_tick_, self.receive_retry_interval))
+            {
+                self.retry_receive();
+                self.last_rx_tick_ = now;
+                auto max_retries = self.receive_retries == 0 ? 1u : self.receive_retries;
+                if(++self.receive_retry_count_ >= max_retries)
+                {
+                    self.send_cancel();
+                    self.ph_ = phase::done;
+                    self.end_ = end_state::timeout;
+                    throw timeout{};
+                }
+            }
+            self.sleep_for(poll_interval);
         }
     }
 
