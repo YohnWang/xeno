@@ -76,6 +76,8 @@ int receive(this auto &&self, auto &&f);
 
 bool try_finish_batch(this auto &&self);
 void finish_batch(this auto &&self);
+
+void cancel(this auto &&self, std::string reason = {}); // 发 CAN 并抛 cancelled
 ```
 
 span 出参支持与回调一致的四种只读元素类型：
@@ -109,6 +111,9 @@ std::span<const char> &          std::span<const std::int8_t> &
 
 - `try_link()`、`try_receive()`、`try_finish_batch()` **不抛 timeout**；
   `cancelled` / `failed` 和回调抛出的异常仍然传播。
+- `cancel(reason)` 抛出的 `cancelled::what()` 为
+  `"ymodem: transfer cancelled: " + reason`；`reason` 为空或远端中止时返回
+  `"ymodem: transfer cancelled"`。异常基类是 `std::runtime_error`。
 - `link()`、`receive()`、`finish_batch()` 超时后发 8 个 CAN，设置
   `end_state::timeout` 并抛 `timeout`。
 - `receive()` / `try_receive()` 必须在 `link()` / `try_link()` 成功后调用；
@@ -328,7 +333,8 @@ payload 布局：`filename \0 filesize_decimal \0 [mtime ...]`
 
 - 远端 `CAN/CTRL_C` 只在帧头首字节检测；数据段中的 `0x18/0x03` 是合法数据。
 - 检测到远端中止后回发 8 个 CAN，抛 `cancelled`。
-- 本地 `cancel()` 同样回发 8 个 CAN。
+- 本地 `cancel(reason)` 同样先回发 8 个 CAN，再抛 `cancelled`；`reason`
+  非空时追加为 `...cancelled: <reason>`。发送方收到 CAN 串后中止本次传输。
 
 ## 已知限制
 
@@ -350,7 +356,7 @@ payload 布局：`filename \0 filesize_decimal \0 [mtime ...]`
 测试：[`test/ymodem_test.cc`](../../test/ymodem_test.cc)
 
 - host（g++-16）和 `arm_simulator`（arm-none-eabi-g++ 16.2.0 + QEMU
-  mps2-an500）均通过，49 组用例。
+  mps2-an500）均通过，50 组用例。
 - 覆盖：正常传输、Block 0、CRC/序号错误、重复/乱序帧、帧缓冲、回调类型、
   span 出参、try/link 与 try/receive 的非阻塞/阻塞行为、主动 NAK 重试、
   链路/接收超时、配置覆盖、批处理结束、取消和未知大小拒绝等。

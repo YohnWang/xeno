@@ -81,6 +81,8 @@ int receive(this auto &&self, auto &&f);
 
 bool try_finish_batch(this auto &&self);
 void finish_batch(this auto &&self);
+
+void cancel(this auto &&self, std::string reason = {}); // 发 CAN 并抛 cancelled
 ```
 
 span 出参支持与回调一致的四种只读元素类型：
@@ -114,6 +116,9 @@ std::span<const char> &          std::span<const std::int8_t> &
 
 - `try_link()`、`try_receive()`、`try_finish_batch()` **不抛 timeout**；
   `cancelled` / `failed` 和回调抛出的异常仍然传播。
+- `cancel(reason)` 抛出的 `cancelled::what()` 为
+  `"zmodem: transfer cancelled: " + reason`；`reason` 为空或远端中止时返回
+  `"zmodem: transfer cancelled"`。异常基类是 `std::runtime_error`。
 - `link()`、`receive()`、`finish_batch()` 超时后发 10 个 CAN + 10 个 BS，
   设置 `end_state::timeout` 并抛 `timeout`。
 - `receive()` / `try_receive()` 必须在 link 成功后调用；未连接时抛 `failed`。
@@ -401,7 +406,9 @@ data... ZDLE <end> crc...
 
 ### 取消
 
-- 本地 `cancel()` / 远端 CAN 串 / ZCAN / ZABORT 都会发 CAN 串并抛 `cancelled`。
+- 本地 `cancel(reason)` 先发 10 个 CAN + 10 个 0x08，再抛 `cancelled`；
+  `reason` 非空时追加为 `...cancelled: <reason>`。发送方收到 CAN 串后中止本次传输。
+- 远端 CAN 串 / ZCAN / ZABORT 抛默认消息的 `cancelled`。
 - CAN 只在头部搜索或 ZDLE 转义上下文中识别；普通数据字节经过 ZDLE 转义，
   不会误判。
 
@@ -435,7 +442,7 @@ data... ZDLE <end> crc...
 模拟测试：[`test/zmodem_test.cc`](../../test/zmodem_test.cc)
 
 - host（g++-16）和 `arm_simulator`（arm-none-eabi-g++ 16.2.0 + QEMU
-  mps2-an500）均通过，34 组用例。
+  mps2-an500）均通过，35 组用例。
 - 覆盖 CRC16/CRC32、hex/ZBIN/ZBIN32 头、ZDLE 全控制字符转义、四种子包结尾、
   ZFILE 元数据、0 字节文件、未知大小拒绝、ZSINIT、ZRQINIT、ZFREECNT、
   ZCHALLENGE、ZCAN、ZABORT、ZCOMMAND、ZSTDERR、提前 ZEOF、坏 CRC/位置重同步、

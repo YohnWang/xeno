@@ -9,9 +9,11 @@
 #include<exception>
 #include<limits>
 #include<span>
+#include<stdexcept>
 #include<string>
 #include<thread>
 #include<type_traits>
+#include<utility>
 
 namespace xeno
 {
@@ -53,38 +55,46 @@ public:
     static constexpr std::size_t kUnknown = std::numeric_limits<std::size_t>::max();
 
     // 传输非正常结束。link()/receive()/finish_batch() 在终止状态下抛出。
-    struct error : std::exception
+    struct error : std::runtime_error
     {
-        const char *what() const noexcept override
-        {
-            return "ymodem: transfer error";
-        }
+        using std::runtime_error::runtime_error;
     };
 
     // 本地 cancel()、远端 CAN/CTRL-C，或中止后再次调用 link()/receive()/finish_batch()。
+    // cancel(reason) 把 reason 追加到默认消息后：what() = "...cancelled: <reason>"。
     struct cancelled : error
     {
-        const char *what() const noexcept override
+        cancelled()
+            : error("ymodem: transfer cancelled")
         {
-            return "ymodem: transfer cancelled";
+        }
+
+        explicit cancelled(std::string reason)
+            : error("ymodem: transfer cancelled: " + reason)
+        {
         }
     };
 
     // 握手阶段收到 EOT、空文件头、未知文件大小，或数据未收完就收到 EOT。
     struct failed : error
     {
-        const char *what() const noexcept override
+        failed()
+            : error("ymodem: transfer failed")
         {
-            return "ymodem: transfer failed";
+        }
+
+        explicit failed(const char *what)
+            : error(what)
+        {
         }
     };
 
     // 阻塞接口重试耗尽。
     struct timeout : failed
     {
-        const char *what() const noexcept override
+        timeout()
+            : failed("ymodem: transfer timeout")
         {
-            return "ymodem: transfer timeout";
         }
     };
 
@@ -401,7 +411,8 @@ public:
 
     // ---- 本地用户按 Ctrl+C 时调用：向发送方发 CAN，并抛 cancelled ----
     // idle/finished 状态下是空操作，不抛异常。
-    void cancel(this auto &&self)
+    // reason 为空时 what() 返回默认消息，否则追加为 "...cancelled: <reason>"。
+    void cancel(this auto &&self, std::string reason = {})
     {
         if(self.ph_ == phase::idle || self.ph_ == phase::finished)
             return;
@@ -409,7 +420,9 @@ public:
         self.end_ = end_state::cancelled;
         self.reset_frame();
         self.send_cancel();
-        throw cancelled{};
+        if(reason.empty())
+            throw cancelled{};
+        throw cancelled{std::move(reason)};
     }
 
     void reset()

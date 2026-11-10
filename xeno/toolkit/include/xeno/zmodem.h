@@ -9,9 +9,11 @@
 #include<exception>
 #include<limits>
 #include<span>
+#include<stdexcept>
 #include<string>
 #include<thread>
 #include<type_traits>
+#include<utility>
 
 namespace xeno
 {
@@ -62,38 +64,46 @@ public:
     };
 
     // 传输非正常结束。link()/receive()/finish_batch() 在终止状态下抛出。
-    struct error : std::exception
+    struct error : std::runtime_error
     {
-        const char *what() const noexcept override
-        {
-            return "zmodem: transfer error";
-        }
+        using std::runtime_error::runtime_error;
     };
 
     // 本地 cancel()、远端 CAN/ZABORT，或中止后再次调用。
+    // cancel(reason) 把 reason 追加到默认消息后：what() = "...cancelled: <reason>"。
     struct cancelled : error
     {
-        const char *what() const noexcept override
+        cancelled()
+            : error("zmodem: transfer cancelled")
         {
-            return "zmodem: transfer cancelled";
+        }
+
+        explicit cancelled(std::string reason)
+            : error("zmodem: transfer cancelled: " + reason)
+        {
         }
     };
 
     // 协议错误、不支持的命令、提前结束等。
     struct failed : error
     {
-        const char *what() const noexcept override
+        failed()
+            : error("zmodem: transfer failed")
         {
-            return "zmodem: transfer failed";
+        }
+
+        explicit failed(const char *what)
+            : error(what)
+        {
         }
     };
 
     // 阻塞接口重试耗尽。
     struct timeout : failed
     {
-        const char *what() const noexcept override
+        timeout()
+            : failed("zmodem: transfer timeout")
         {
-            return "zmodem: transfer timeout";
         }
     };
 
@@ -454,9 +464,10 @@ public:
 
     // ---- 本地用户按 Ctrl+C 时调用：发 CAN 串并抛 cancelled ----
     // idle/done 状态下是空操作，不抛异常。
-    void cancel(this auto &&self)
+    // reason 为空时 what() 返回默认消息，否则追加为 "...cancelled: <reason>"。
+    void cancel(this auto &&self, std::string reason = {})
     {
-        self.cancel_impl();
+        self.cancel_impl(std::move(reason));
     }
 
     void reset()
@@ -1711,7 +1722,7 @@ private:
         }
     }
 
-    void cancel_impl(this auto &&self)
+    void cancel_impl(this auto &&self, std::string reason)
     {
         if(self.ph_ == phase::idle || self.ph_ == phase::done)
             return;
@@ -1720,7 +1731,9 @@ private:
         self.end_ = end_state::cancelled;
         self.reset_parser();
         self.reset_data();
-        throw cancelled{};
+        if(reason.empty())
+            throw cancelled{};
+        throw cancelled{std::move(reason)};
     }
 };
 
