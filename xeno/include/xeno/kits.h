@@ -23,6 +23,12 @@ if(!(cond)){__write_terminal("assertion failed in: ");\
 
 #include<charconv>
 #include<array>
+#include<chrono>
+#include<condition_variable>
+#include<cstring>
+#include<errno.h>
+#include<limits.h>
+#include<mutex>
 
 namespace xeno
 {
@@ -93,6 +99,335 @@ public:
         return a[(front + i) % N];
     }
 };
+
+// fifo缓冲：单读线程 + 单写线程（由使用者保证，不支持单线程环境）
+//
+// 整笔语义 + 分块推进：read/write 以 n 字节为目标，内部按当前可用的数据/空间分块拷贝，
+// 块与块之间等待并让出缓冲区，因此 n 可以大于 N，读写两端可以边写边读。
+// notify_reader()/notify_writer() 是一次性提示：让对端停止等待，返回已处理字节数
+// （可能为 0）；提示被消费后恢复正常。clear() 只清空缓冲数据。
+// 出错返回 -1，read_errno()/write_errno() 给出 errno.h 错误码（成功不清零）。
+template <size_t N>
+class fifo_buffer
+{
+    static_assert(N > 0, "fifo_buffer: N must be positive");
+    static_assert(N <= static_cast<size_t>(INT_MAX), "fifo_buffer: N must fit int");
+
+    std::array<unsigned char, N> buffer_;
+    size_t read_pos_ = 0;           // 读游标，[0, N)
+    size_t write_pos_ = 0;          // 写游标，[0, N)
+    size_t used_ = 0;               // 已存字节数，[0, N]
+    bool reader_notified_ = false;  // 待消费：提示读端提前退出
+    bool writer_notified_ = false;  // 待消费：提示写端提前退出
+    int read_errno_ = 0;
+    int write_errno_ = 0;
+    std::mutex mutex_;
+    std::condition_variable data_cv_;   // 读端等待：reader_notified_ || used_ != 0
+    std::condition_variable space_cv_;  // 写端等待：writer_notified_ || free_space() != 0
+
+    size_t free_space() const
+    {
+        return N - used_;
+    }
+
+    int fail_read(int e)
+    {
+        read_errno_ = e;
+        return -1;
+    }
+
+    int fail_write(int e)
+    {
+        write_errno_ = e;
+        return -1;
+    }
+
+    // 以下要求持锁，0 <= n <= N；n == 0 直接返回；跨尾用两段 memcpy
+    void copy_in(const void *buf, size_t n)
+    {
+        if (n == 0)
+            return;
+        auto p = static_cast<const unsigned char *>(buf);
+        size_t first = n < N - write_pos_ ? n : N - write_pos_;
+        std::memcpy(buffer_.data() + write_pos_, p, first);
+        std::memcpy(buffer_.data(), p + first, n - first);
+        write_pos_ += n;
+        if (write_pos_ >= N)
+            write_pos_ -= N;
+        used_ += n;
+    }
+
+    void copy_out(void *buf, size_t n)
+    {
+        if (n == 0)
+            return;
+        auto p = static_cast<unsigned char *>(buf);
+        size_t first = n < N - read_pos_ ? n : N - read_pos_;
+        std::memcpy(p, buffer_.data() + read_pos_, first);
+        std::memcpy(p + first, buffer_.data(), n - first);
+        read_pos_ += n;
+        if (read_pos_ >= N)
+            read_pos_ -= N;
+        used_ -= n;
+    }
+
+public:
+
+    // 尝试写入：写当前能写的字节数，返回实际写入数；完全没空间时 -1/EAGAIN
+    int try_write(const void *buf, size_t n)
+    {
+        if (n == 0)
+            return 0;
+        if (n > static_cast<size_t>(INT_MAX))
+            return fail_write(EINVAL);
+
+        std::lock_guard lock{mutex_};
+        if (writer_notified_)
+        {
+            writer_notified_ = false;
+            size_t k = free_space() < n ? free_space() : n;
+            copy_in(buf, k);
+            if (k)
+                data_cv_.notify_one();
+            return static_cast<int>(k);
+        }
+        size_t k = free_space() < n ? free_space() : n;
+        if (k == 0)
+            return fail_write(EAGAIN);
+        copy_in(buf, k);
+        data_cv_.notify_one();
+        return static_cast<int>(k);
+    }
+
+    // 尝试在指定时间段内写入：尽量写满 n；超时时返回已写入数，零进展才 -1/ETIMEDOUT
+    template<typename Rep, typename Period>
+    int write_for(const std::chrono::duration<Rep, Period> &d, const void *buf, size_t n)
+    {
+        if (n == 0)
+            return 0;
+        if (n > static_cast<size_t>(INT_MAX))
+            return fail_write(EINVAL);
+
+        auto p = static_cast<const unsigned char *>(buf);
+        size_t done = 0;
+        std::unique_lock lock{mutex_};
+        auto deadline = std::chrono::steady_clock::now() + d;
+        while (done < n)
+        {
+            if (writer_notified_)
+            {
+                writer_notified_ = false;
+                size_t k = free_space() < n - done ? free_space() : n - done;
+                if (k)
+                {
+                    copy_in(p + done, k);
+                    done += k;
+                    data_cv_.notify_one();
+                }
+                return static_cast<int>(done);
+            }
+            if (free_space() == 0)
+            {
+                if (!space_cv_.wait_until(lock, deadline, [this] { return writer_notified_ || free_space() != 0; }))
+                    return done ? static_cast<int>(done) : fail_write(ETIMEDOUT);
+                continue;
+            }
+            size_t k = free_space() < n - done ? free_space() : n - done;
+            copy_in(p + done, k);
+            done += k;
+            data_cv_.notify_one();
+        }
+        return static_cast<int>(done);
+    }
+
+    // 阻塞式写入：分块写满 n，直到完成或被 notify_writer() 提示中断
+    int write(const void *buf, size_t n)
+    {
+        if (n == 0)
+            return 0;
+        if (n > static_cast<size_t>(INT_MAX))
+            return fail_write(EINVAL);
+
+        auto p = static_cast<const unsigned char *>(buf);
+        size_t done = 0;
+        std::unique_lock lock{mutex_};
+        while (done < n)
+        {
+            if (writer_notified_)
+            {
+                writer_notified_ = false;
+                size_t k = free_space() < n - done ? free_space() : n - done;
+                if (k)
+                {
+                    copy_in(p + done, k);
+                    done += k;
+                    data_cv_.notify_one();
+                }
+                return static_cast<int>(done);
+            }
+            if (free_space() == 0)
+            {
+                space_cv_.wait(lock, [this] { return writer_notified_ || free_space() != 0; });
+                continue;
+            }
+            size_t k = free_space() < n - done ? free_space() : n - done;
+            copy_in(p + done, k);
+            done += k;
+            data_cv_.notify_one();
+        }
+        return static_cast<int>(done);
+    }
+
+    // 提示读端提前退出：当前/下一次 read 停止等待，返回已读字节数
+    void notify_reader()
+    {
+        {
+            std::lock_guard lock{mutex_};
+            reader_notified_ = true;
+        }
+        data_cv_.notify_all();
+    }
+
+    // 尝试读取：读当前能读的字节数，返回实际读出数；完全没数据时 -1/EAGAIN
+    int try_read(void *buf, size_t n)
+    {
+        if (n == 0)
+            return 0;
+        if (n > static_cast<size_t>(INT_MAX))
+            return fail_read(EINVAL);
+
+        std::lock_guard lock{mutex_};
+        if (reader_notified_)
+        {
+            reader_notified_ = false;
+            size_t k = used_ < n ? used_ : n;
+            copy_out(buf, k);
+            if (k)
+                space_cv_.notify_one();
+            return static_cast<int>(k);
+        }
+        size_t k = used_ < n ? used_ : n;
+        if (k == 0)
+            return fail_read(EAGAIN);
+        copy_out(buf, k);
+        space_cv_.notify_one();
+        return static_cast<int>(k);
+    }
+
+    // 指定时间内尝试读取：尽量读满 n；超时时返回已读出数，零进展才 -1/ETIMEDOUT
+    template<typename Rep, typename Period>
+    int read_for(const std::chrono::duration<Rep, Period> &d, void *buf, size_t n)
+    {
+        if (n == 0)
+            return 0;
+        if (n > static_cast<size_t>(INT_MAX))
+            return fail_read(EINVAL);
+
+        auto p = static_cast<unsigned char *>(buf);
+        size_t done = 0;
+        std::unique_lock lock{mutex_};
+        auto deadline = std::chrono::steady_clock::now() + d;
+        while (done < n)
+        {
+            if (reader_notified_)
+            {
+                reader_notified_ = false;
+                size_t k = used_ < n - done ? used_ : n - done;
+                if (k)
+                {
+                    copy_out(p + done, k);
+                    done += k;
+                    space_cv_.notify_one();
+                }
+                return static_cast<int>(done);
+            }
+            if (used_ == 0)
+            {
+                if (!data_cv_.wait_until(lock, deadline, [this] { return reader_notified_ || used_ != 0; }))
+                    return done ? static_cast<int>(done) : fail_read(ETIMEDOUT);
+                continue;
+            }
+            size_t k = used_ < n - done ? used_ : n - done;
+            copy_out(p + done, k);
+            done += k;
+            space_cv_.notify_one();
+        }
+        return static_cast<int>(done);
+    }
+
+    // 阻塞式读取：分块读满 n，直到完成或被 notify_reader() 提示中断
+    int read(void *buf, size_t n)
+    {
+        if (n == 0)
+            return 0;
+        if (n > static_cast<size_t>(INT_MAX))
+            return fail_read(EINVAL);
+
+        auto p = static_cast<unsigned char *>(buf);
+        size_t done = 0;
+        std::unique_lock lock{mutex_};
+        while (done < n)
+        {
+            if (reader_notified_)
+            {
+                reader_notified_ = false;
+                size_t k = used_ < n - done ? used_ : n - done;
+                if (k)
+                {
+                    copy_out(p + done, k);
+                    done += k;
+                    space_cv_.notify_one();
+                }
+                return static_cast<int>(done);
+            }
+            if (used_ == 0)
+            {
+                data_cv_.wait(lock, [this] { return reader_notified_ || used_ != 0; });
+                continue;
+            }
+            size_t k = used_ < n - done ? used_ : n - done;
+            copy_out(p + done, k);
+            done += k;
+            space_cv_.notify_one();
+        }
+        return static_cast<int>(done);
+    }
+
+    // 提示写端提前退出：当前/下一次 write 停止等待，返回已写字节数
+    void notify_writer()
+    {
+        {
+            std::lock_guard lock{mutex_};
+            writer_notified_ = true;
+        }
+        space_cv_.notify_all();
+    }
+
+    // 清空缓冲数据；不清提示标志，不清 errno
+    void clear()
+    {
+        {
+            std::lock_guard lock{mutex_};
+            used_ = 0;
+            read_pos_ = 0;
+            write_pos_ = 0;
+        }
+        space_cv_.notify_all();
+    }
+
+    // 读侧最近一次失败的错误码；只由读线程查询，成功不清零
+    int read_errno() const noexcept
+    {
+        return read_errno_;
+    }
+
+    // 写侧最近一次失败的错误码；只由写线程查询，成功不清零
+    int write_errno() const noexcept
+    {
+        return write_errno_;
+    }
+};
+
 
 struct sched_suspend_guard
 {
