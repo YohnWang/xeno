@@ -23,6 +23,7 @@ if(!(cond)){__write_terminal("assertion failed in: ");\
 
 #include<charconv>
 #include<array>
+#include<atomic>
 #include<chrono>
 #include<condition_variable>
 #include<cstring>
@@ -105,7 +106,10 @@ public:
 // 整笔语义 + 分块推进：read/write 以 n 字节为目标，内部按当前可用的数据/空间分块拷贝，
 // 块与块之间等待并让出缓冲区，因此 n 可以大于 N，读写两端可以边写边读。
 // notify_reader()/notify_writer() 是一次性提示：让对端停止等待，返回已处理字节数
-// （可能为 0）；提示被消费后恢复正常。clear() 只清空缓冲数据。
+// （可能为 0）；提示被消费后恢复正常。
+// finish_write()/finish_read() 是永久结束：读端读空缓冲后得到 EOF（read 返回 0），
+// 对已结束方向的读写返回 -1/EPIPE；write_finished()/read_finished() 可无锁查询。
+// clear() 只清空缓冲数据；reset() 完整复位（调用时两端必须空闲），可重新复用对象。
 // 出错返回 -1，read_errno()/write_errno() 给出 errno.h 错误码（成功不清零）。
 template <size_t N>
 class fifo_buffer
@@ -119,11 +123,13 @@ class fifo_buffer
     size_t used_ = 0;               // 已存字节数，[0, N]
     bool reader_notified_ = false;  // 待消费：提示读端提前退出
     bool writer_notified_ = false;  // 待消费：提示写端提前退出
+    std::atomic<bool> write_finished_{false};  // 写端永久结束
+    std::atomic<bool> read_finished_{false};   // 读端永久结束
     int read_errno_ = 0;
     int write_errno_ = 0;
     std::mutex mutex_;
-    std::condition_variable data_cv_;   // 读端等待：reader_notified_ || used_ != 0
-    std::condition_variable space_cv_;  // 写端等待：writer_notified_ || free_space() != 0
+    std::condition_variable data_cv_;   // 读端等待：write_finished_ || reader_notified_ || used_ != 0
+    std::condition_variable space_cv_;  // 写端等待：writer_notified_ || read_finished_ || free_space() != 0
 
     size_t free_space() const
     {
@@ -150,7 +156,8 @@ class fifo_buffer
         auto p = static_cast<const unsigned char *>(buf);
         size_t first = n < N - write_pos_ ? n : N - write_pos_;
         std::memcpy(buffer_.data() + write_pos_, p, first);
-        std::memcpy(buffer_.data(), p + first, n - first);
+        if (n > first)
+            std::memcpy(buffer_.data(), p + first, n - first);
         write_pos_ += n;
         if (write_pos_ >= N)
             write_pos_ -= N;
@@ -164,7 +171,8 @@ class fifo_buffer
         auto p = static_cast<unsigned char *>(buf);
         size_t first = n < N - read_pos_ ? n : N - read_pos_;
         std::memcpy(p, buffer_.data() + read_pos_, first);
-        std::memcpy(p + first, buffer_.data(), n - first);
+        if (n > first)
+            std::memcpy(p + first, buffer_.data(), n - first);
         read_pos_ += n;
         if (read_pos_ >= N)
             read_pos_ -= N;
@@ -182,6 +190,8 @@ public:
             return fail_write(EINVAL);
 
         std::lock_guard lock{mutex_};
+        if (write_finished() || read_finished())
+            return fail_write(EPIPE);
         if (writer_notified_)
         {
             writer_notified_ = false;
@@ -210,10 +220,15 @@ public:
 
         auto p = static_cast<const unsigned char *>(buf);
         size_t done = 0;
+        bool wake_reader = false;
         std::unique_lock lock{mutex_};
+        if (write_finished() || read_finished())
+            return fail_write(EPIPE);
         auto deadline = std::chrono::steady_clock::now() + d;
         while (done < n)
         {
+            if (read_finished())
+                break; // 本次调用期间读端结束：返回已写部分，不置 errno
             if (writer_notified_)
             {
                 writer_notified_ = false;
@@ -222,25 +237,39 @@ public:
                 {
                     copy_in(p + done, k);
                     done += k;
-                    data_cv_.notify_one();
+                    wake_reader = true;
                 }
-                return static_cast<int>(done);
+                break;
             }
             if (free_space() == 0)
             {
-                if (!space_cv_.wait_until(lock, deadline, [this] { return writer_notified_ || free_space() != 0; }))
-                    return done ? static_cast<int>(done) : fail_write(ETIMEDOUT);
+                if (wake_reader)
+                {
+                    data_cv_.notify_one();
+                    wake_reader = false;
+                }
+                if (!space_cv_.wait_until(lock, deadline, [this] {
+                        return writer_notified_ || read_finished() || free_space() != 0;
+                    }))
+                {
+                    if (done == 0)
+                        return fail_write(ETIMEDOUT);
+                    break;
+                }
                 continue;
             }
             size_t k = free_space() < n - done ? free_space() : n - done;
             copy_in(p + done, k);
             done += k;
-            data_cv_.notify_one();
+            wake_reader = true;
         }
+        lock.unlock();
+        if (wake_reader)
+            data_cv_.notify_one();
         return static_cast<int>(done);
     }
 
-    // 阻塞式写入：分块写满 n，直到完成或被 notify_writer() 提示中断
+    // 阻塞式写入：分块写满 n，直到完成、被 notify_writer() 提示或被 finish_read() 结束
     int write(const void *buf, size_t n)
     {
         if (n == 0)
@@ -250,9 +279,14 @@ public:
 
         auto p = static_cast<const unsigned char *>(buf);
         size_t done = 0;
+        bool wake_reader = false;
         std::unique_lock lock{mutex_};
+        if (write_finished() || read_finished())
+            return fail_write(EPIPE);
         while (done < n)
         {
+            if (read_finished())
+                break; // 本次调用期间读端结束：返回已写部分，不置 errno
             if (writer_notified_)
             {
                 writer_notified_ = false;
@@ -261,20 +295,30 @@ public:
                 {
                     copy_in(p + done, k);
                     done += k;
-                    data_cv_.notify_one();
+                    wake_reader = true;
                 }
-                return static_cast<int>(done);
+                break;
             }
             if (free_space() == 0)
             {
-                space_cv_.wait(lock, [this] { return writer_notified_ || free_space() != 0; });
+                if (wake_reader)
+                {
+                    data_cv_.notify_one();
+                    wake_reader = false;
+                }
+                space_cv_.wait(lock, [this] {
+                    return writer_notified_ || read_finished() || free_space() != 0;
+                });
                 continue;
             }
             size_t k = free_space() < n - done ? free_space() : n - done;
             copy_in(p + done, k);
             done += k;
-            data_cv_.notify_one();
+            wake_reader = true;
         }
+        lock.unlock();
+        if (wake_reader)
+            data_cv_.notify_one();
         return static_cast<int>(done);
     }
 
@@ -288,7 +332,24 @@ public:
         data_cv_.notify_all();
     }
 
-    // 尝试读取：读当前能读的字节数，返回实际读出数；完全没数据时 -1/EAGAIN
+    // 永久结束写端：读端排空缓冲后得到 EOF（read 返回 0）；之后的写返回 -1/EPIPE
+    void finish_write()
+    {
+        {
+            std::lock_guard lock{mutex_};
+            reader_notified_ = false;
+            write_finished_.store(true, std::memory_order_relaxed);
+        }
+        data_cv_.notify_all();
+    }
+
+    // 写端是否已永久结束；无锁查询
+    bool write_finished() const noexcept
+    {
+        return write_finished_.load(std::memory_order_relaxed);
+    }
+
+    // 尝试读取：读当前能读的字节数；空缓冲的 0 可能是 EOF，-1/EAGAIN 表示暂时没数据
     int try_read(void *buf, size_t n)
     {
         if (n == 0)
@@ -297,6 +358,10 @@ public:
             return fail_read(EINVAL);
 
         std::lock_guard lock{mutex_};
+        if (read_finished())
+            return fail_read(EPIPE);
+        if (write_finished() && used_ == 0)
+            return 0; // EOF
         if (reader_notified_)
         {
             reader_notified_ = false;
@@ -325,10 +390,15 @@ public:
 
         auto p = static_cast<unsigned char *>(buf);
         size_t done = 0;
+        bool wake_writer = false;
         std::unique_lock lock{mutex_};
+        if (read_finished())
+            return fail_read(EPIPE);
         auto deadline = std::chrono::steady_clock::now() + d;
         while (done < n)
         {
+            if (write_finished() && used_ == 0)
+                break; // 排空后 EOF，done 可为 0
             if (reader_notified_)
             {
                 reader_notified_ = false;
@@ -337,25 +407,39 @@ public:
                 {
                     copy_out(p + done, k);
                     done += k;
-                    space_cv_.notify_one();
+                    wake_writer = true;
                 }
-                return static_cast<int>(done);
+                break;
             }
             if (used_ == 0)
             {
-                if (!data_cv_.wait_until(lock, deadline, [this] { return reader_notified_ || used_ != 0; }))
-                    return done ? static_cast<int>(done) : fail_read(ETIMEDOUT);
+                if (wake_writer)
+                {
+                    space_cv_.notify_one();
+                    wake_writer = false;
+                }
+                if (!data_cv_.wait_until(lock, deadline, [this] {
+                        return write_finished() || reader_notified_ || used_ != 0;
+                    }))
+                {
+                    if (done == 0)
+                        return fail_read(ETIMEDOUT);
+                    break;
+                }
                 continue;
             }
             size_t k = used_ < n - done ? used_ : n - done;
             copy_out(p + done, k);
             done += k;
-            space_cv_.notify_one();
+            wake_writer = true;
         }
+        lock.unlock();
+        if (wake_writer)
+            space_cv_.notify_one();
         return static_cast<int>(done);
     }
 
-    // 阻塞式读取：分块读满 n，直到完成或被 notify_reader() 提示中断
+    // 阻塞式读取：分块读满 n，直到完成、被 notify_reader() 提示或写端 finish 后读到 EOF
     int read(void *buf, size_t n)
     {
         if (n == 0)
@@ -365,9 +449,14 @@ public:
 
         auto p = static_cast<unsigned char *>(buf);
         size_t done = 0;
+        bool wake_writer = false;
         std::unique_lock lock{mutex_};
+        if (read_finished())
+            return fail_read(EPIPE);
         while (done < n)
         {
+            if (write_finished() && used_ == 0)
+                break; // 排空后 EOF，done 可为 0
             if (reader_notified_)
             {
                 reader_notified_ = false;
@@ -376,20 +465,30 @@ public:
                 {
                     copy_out(p + done, k);
                     done += k;
-                    space_cv_.notify_one();
+                    wake_writer = true;
                 }
-                return static_cast<int>(done);
+                break;
             }
             if (used_ == 0)
             {
-                data_cv_.wait(lock, [this] { return reader_notified_ || used_ != 0; });
+                if (wake_writer)
+                {
+                    space_cv_.notify_one();
+                    wake_writer = false;
+                }
+                data_cv_.wait(lock, [this] {
+                    return write_finished() || reader_notified_ || used_ != 0;
+                });
                 continue;
             }
             size_t k = used_ < n - done ? used_ : n - done;
             copy_out(p + done, k);
             done += k;
-            space_cv_.notify_one();
+            wake_writer = true;
         }
+        lock.unlock();
+        if (wake_writer)
+            space_cv_.notify_one();
         return static_cast<int>(done);
     }
 
@@ -403,7 +502,24 @@ public:
         space_cv_.notify_all();
     }
 
-    // 清空缓冲数据；不清提示标志，不清 errno
+    // 永久结束读端：阻塞写者返回已写字节数；之后的新写和读返回 -1/EPIPE
+    void finish_read()
+    {
+        {
+            std::lock_guard lock{mutex_};
+            writer_notified_ = false;
+            read_finished_.store(true, std::memory_order_relaxed);
+        }
+        space_cv_.notify_all();
+    }
+
+    // 读端是否已永久结束；无锁查询
+    bool read_finished() const noexcept
+    {
+        return read_finished_.load(std::memory_order_relaxed);
+    }
+
+    // 清空缓冲数据；不清提示标志、finish 状态和 errno
     void clear()
     {
         {
@@ -413,6 +529,21 @@ public:
             write_pos_ = 0;
         }
         space_cv_.notify_all();
+    }
+
+    // 完整复位：清数据、提示、finish 状态和 errno；调用时读、写两端必须都空闲（使用者保证）
+    void reset()
+    {
+        std::lock_guard lock{mutex_};
+        used_ = 0;
+        read_pos_ = 0;
+        write_pos_ = 0;
+        reader_notified_ = false;
+        writer_notified_ = false;
+        write_finished_.store(false, std::memory_order_relaxed);
+        read_finished_.store(false, std::memory_order_relaxed);
+        read_errno_ = 0;
+        write_errno_ = 0;
     }
 
     // 读侧最近一次失败的错误码；只由读线程查询，成功不清零
