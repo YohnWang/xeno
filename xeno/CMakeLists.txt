@@ -9,7 +9,7 @@ target_include_directories(xeno_headers INTERFACE include)
 target_link_libraries(xeno_headers INTERFACE freertos_headers)
 target_compile_options(xeno_headers
     INTERFACE 
-        $<$<COMPILE_LANGUAGE:C,CXX>:--include=xeno/predefined.h>
+        $<$<COMPILE_LANGUAGE:C,CXX>:--include=${CMAKE_CURRENT_LIST_DIR}/include/xeno/predefined.h>
         -ftls-model=local-exec
 )
 

@@ -38,7 +38,7 @@ template <typename T, size_t N>
 class static_queue
 {
     static constexpr size_t queue_size = N;
-    std::array<T, queue_size> a;
+    std::array<T, queue_size> a{};
     size_t front = 0;
     size_t rear = 0;
 
