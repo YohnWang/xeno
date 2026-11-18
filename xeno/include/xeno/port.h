@@ -21,8 +21,9 @@ bool __scheduler_suspend();
 void __scheduler_resume();
 
 
-extern uint8_t __malloc_buf[];
-extern size_t  __malloc_buf_size;
+extern uint8_t __malloc_buf_start[];
+extern uint8_t __malloc_buf_end[]; // 弱默认定义，链接脚本可用普通赋值覆盖
+extern size_t __malloc_buf_size(); // 弱默认按 start/end 计算，端口可强定义覆盖
 
 #ifdef __cplusplus
 }
