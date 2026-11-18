@@ -7,6 +7,8 @@
 
 #include<iterator>
 
+[[gnu::weak]] const char *__programname = "main";
+
 static _Unwind_Reason_Code backtrace_callback(struct _Unwind_Context* context, void* arg)
 {
     uintptr_t pc = _Unwind_GetIP(context);
@@ -36,7 +38,9 @@ static void write_terminal(const char *s)
 
 void print_stacktrace_array(const stacktrace_array *parray)
 {
-    write_terminal("addr2line -i -p -C -f -e main ");
+    write_terminal("addr2line -i -p -C -f -e ");
+    write_terminal(__programname);
+    write_terminal(" ");
     for(int i = 0; i < parray->n; i++)
     {
         char buf[8 * 2 + 1] = {};
