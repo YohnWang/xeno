@@ -39,12 +39,15 @@ int pthread_cond_signal(pthread_cond_t *cond)
 
 int pthread_cond_clockwait(pthread_cond_t *__restrict cond,
                    pthread_mutex_t *__restrict mutex, clockid_t clockid,
-				   const struct timespec *__restrict abstime)
+                   const struct timespec *__restrict abstime)
 {
+    if(clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC)
+        return EINVAL;
+
+    if(abstime != nullptr && (abstime->tv_nsec < 0 || abstime->tv_nsec >= 1'000'000'000L))
+        return EINVAL;
+
     int ret = 0;
-    struct timespec start;
-    clock_gettime(clockid, &start);
-    
     int expected = __atomic_load_n(cond, __ATOMIC_ACQUIRE);
 
     if(int r = pthread_mutex_unlock(mutex); r != 0)
@@ -56,6 +59,8 @@ int pthread_cond_clockwait(pthread_cond_t *__restrict cond,
     }
     else
     {
+        struct timespec start;
+        clock_gettime(clockid, &start);
         struct timespec diff = timespec_diff(&start, abstime);
         int64_t ms = diff.tv_sec * 1000LL + diff.tv_nsec / 1000000LL;
         if (ms < 0)
@@ -69,11 +74,12 @@ int pthread_cond_clockwait(pthread_cond_t *__restrict cond,
     return ret;
 }
 
+// POSIX: abstime 以 CLOCK_REALTIME 为基准
 int pthread_cond_timedwait(pthread_cond_t *cond,
                            pthread_mutex_t *mutex,
                            const struct timespec *abstime)
 {
-    return pthread_cond_clockwait(cond, mutex, CLOCK_MONOTONIC, abstime);
+    return pthread_cond_clockwait(cond, mutex, CLOCK_REALTIME, abstime);
 }
 
 int pthread_cond_wait(pthread_cond_t *cond,
