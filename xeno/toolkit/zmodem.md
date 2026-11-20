@@ -1,8 +1,8 @@
 # xeno::zmodem_receiver 使用说明
 
-单文件 ZMODEM 接收端，header-only，位于 `xeno/toolkit/include/xeno/zmodem.h`。
-支持 hex / 16-bit CRC binary / 32-bit CRC binary 三种帧头，支持 ZDLE 转义、四种
-数据子包结尾（ZCRCE/ZCRCG/ZCRCQ/ZCRCW）以及批处理结束握手。
+ZMODEM 接收端，header-only，位于 `xeno/toolkit/include/xeno/zmodem.h`，依赖
+`xeno/crc.h`。支持 hex / 16-bit CRC binary / 32-bit CRC binary 三种帧头，支持
+ZDLE 转义、四种数据子包结尾（ZCRCE/ZCRCG/ZCRCQ/ZCRCW）以及批处理结束握手。
 
 所有文件内容都按原始二进制交付，不做 CR/LF、字符集或文本转换。不支持未知文件大小。
 
@@ -349,8 +349,9 @@ CRC：
 
 - CRC16：多项式 `0x1021`，初值 0，不反射；接收端检查
   `CRC16(type+info+crc) == 0`，数据子包检查 `CRC16(data+end+crc) == 0`。
-- CRC32：反射多项式 `0xEDB88320`，初值 `0xFFFFFFFF`，发送值取反；
-  接收端检查残余值 `0xDEBB20E3`。
+- CRC32：线上算法等价于反射多项式 `0xEDB88320`，初值 `0xFFFFFFFF`，发送值取反；
+  接收端检查残余值 `0xDEBB20E3`。代码中通过 `crc32_iso_hdlc` 实现（正规形式
+  poly `0x04C11DB7` + 反射模式），残差用 `raw()` 取得。
 
 发送端回包使用 hex 头 + CRC16（与 lrzsz 的 `zshhdr` 兼容），并在非 ZFIN/ZACK
 后附加 XON。

@@ -15,6 +15,8 @@
 #include<type_traits>
 #include<utility>
 
+#include"crc.h"
+
 namespace xeno
 {
 
@@ -639,19 +641,6 @@ private:
             self.reset_frame();
     }
 
-    static std::uint16_t crc16(std::span<const std::byte> data)
-    {
-        std::uint16_t crc = 0;
-        for(auto b: data)
-        {
-            crc ^= static_cast<std::uint16_t>(std::to_integer<std::uint8_t>(b)) << 8;
-            for(int i = 0; i < 8; ++i)
-                crc = (crc & 0x8000) ? std::uint16_t((crc << 1) ^ 0x1021)
-                                     : std::uint16_t(crc << 1);
-        }
-        return crc;
-    }
-
     void parse_block0(std::span<const std::byte> payload)
     {
         filename_.clear();
@@ -739,7 +728,8 @@ private:
             std::to_integer<std::uint8_t>(self.body_[data_len + 1]);
 
         std::uint8_t seq = self.hdr_[1], nseq = self.hdr_[2];
-        if(self.crc16(payload) != recv_crc || nseq != static_cast<std::uint8_t>(~seq))
+        if(crc16_xmodem::compute(payload) != recv_crc
+           || nseq != static_cast<std::uint8_t>(~seq))
         {
             self.put_byte(NAK);
             self.reset_frame();

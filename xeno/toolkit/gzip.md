@@ -1,8 +1,8 @@
 # xeno::gzdecoder_basic 使用说明
 
-流式 gzip 解压器，header-only，位于 `xeno/toolkit/include/xeno/gzip.h`。
-完整实现 RFC 1951 DEFLATE（stored / fixed / dynamic、32 KiB 回溯窗口）和
-RFC 1952 gzip 容器，结束前校验 trailer 的 CRC32 与 ISIZE。
+流式 gzip 解压器，header-only，位于 `xeno/toolkit/include/xeno/gzip.h`，依赖
+`xeno/crc.h`。完整实现 RFC 1951 DEFLATE（stored / fixed / dynamic、32 KiB 回溯
+窗口）和 RFC 1952 gzip 容器，结束前校验 trailer 的 CRC32 与 ISIZE。
 
 ```cpp
 template<std::size_t N, std::size_t W = 32768, bool Static = false>
@@ -204,13 +204,13 @@ constexpr std::string_view to_string(gzip_errc) noexcept;
 
 | 部分 | 动态（默认） | 静态 |
 |---|---|---|
-| 解码器对象 `sizeof` | 168 B | 约 39.5 KiB |
+| 解码器对象 `sizeof` | 184 B | 约 39.5 KiB |
 | arena（输入 + 窗口 + 表 + dyn_lengths） | 堆上约 39.4 KiB，一次分配 | 对象内联，同一块 |
 | 其中 DEFLATE 窗口 `W` | 32768 B | 同左 |
 | 其中压缩输入环 `N` | 4096 B | 同左 |
 | 其中 Huffman 表（9/6/7 位 LUT） | 约 2.1 KiB | 同左 |
 | 其中 `dyn_lengths` | 320 B | 同左 |
-| CRC32 表 | 1 KiB rodata | 同左 |
+| CRC32 表（内建/回退） | 1 KiB rodata | 同左 |
 
 动态版本构造时分配一次 arena，之后 `reset()` 复用，不重复分配；静态版本
 零堆分配。`bytes` 不主动清零，所有读取由 `in_used_` / `win_filled_` 界定；

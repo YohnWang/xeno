@@ -8,6 +8,8 @@
 #include<memory>
 #include<string_view>
 
+#include"crc.h"
+
 namespace xeno
 {
 
@@ -54,29 +56,6 @@ enum class gzip_errc : std::uint8_t
 
 namespace gzip_detail
 {
-
-constexpr std::array<std::uint32_t, 256> make_crc32_table() noexcept
-{
-    std::array<std::uint32_t, 256> table{};
-    for(std::size_t i = 0; i < table.size(); ++i)
-    {
-        std::uint32_t c = static_cast<std::uint32_t>(i);
-        for(int bit = 0; bit < 8; ++bit)
-            c = (c & 1u) ? (c >> 1) ^ 0xEDB88320u : c >> 1;
-        table[i] = c;
-    }
-    return table;
-}
-
-inline constexpr auto crc32_table = make_crc32_table();
-
-constexpr std::uint32_t crc32_update(std::uint32_t crc, const std::uint8_t *data,
-                                     std::size_t size) noexcept
-{
-    while(size-- > 0)
-        crc = (crc >> 8) ^ crc32_table[static_cast<std::uint8_t>(crc ^ *data++)];
-    return crc;
-}
 
 // RFC 1951 固定哈夫曼树长度。
 inline constexpr auto fixed_litlen_lengths = [] {
@@ -351,7 +330,7 @@ public:
         opt_ = {};
         opt_pos_ = 0;
         extra_remaining_ = 0;
-        header_crc_ = 0xFFFFFFFFu;
+        header_crc_.reset();
         bfinal_ = false;
         stored_hdr_ = {};
         stored_pos_ = 0;
@@ -372,7 +351,7 @@ public:
         pending_dist_symbol_ = 0;
         trailer_ = {};
         trailer_pos_ = 0;
-        crc_ = 0xFFFFFFFFu;
+        crc_.reset();
         output_size_ = 0;
         state_ = state::header_fixed;
         err_ = gzip_errc::none;
@@ -406,7 +385,7 @@ private:
     std::array<std::uint8_t, 2> opt_{};
     std::uint8_t opt_pos_ = 0;
     std::size_t extra_remaining_ = 0;
-    std::uint32_t header_crc_ = 0xFFFFFFFFu;
+    crc32_iso_hdlc header_crc_;
 
     // ---- block / dynamic header ----
     bool bfinal_ = false;
@@ -434,7 +413,7 @@ private:
     // ---- trailer / 统计 ----
     std::array<std::uint8_t, 8> trailer_{};
     std::uint8_t trailer_pos_ = 0;
-    std::uint32_t crc_ = 0xFFFFFFFFu;
+    crc32_iso_hdlc crc_;
     std::uint32_t output_size_ = 0;
 
     state state_ = state::header_fixed;
@@ -511,8 +490,7 @@ private:
     {
         if(c.produced != c.crc_pos)
         {
-            crc_ = gzip_detail::crc32_update(crc_, c.dst + c.crc_pos,
-                                             c.produced - c.crc_pos);
+            crc_.write(c.dst + c.crc_pos, c.produced - c.crc_pos);
             c.crc_pos = c.produced;
         }
     }
@@ -745,8 +723,8 @@ private:
         if((hdr_[3] & 0xE0u) != 0)
             return fail(gzip_errc::reserved_flags);
         flg_ = hdr_[3];
-        header_crc_ = gzip_detail::crc32_update(0xFFFFFFFFu, hdr_.data(),
-                                                hdr_.size());
+        header_crc_.reset();
+        header_crc_.write(hdr_.data(), hdr_.size());
         state_ = next_header_state();
         return step_result::progress;
     }
@@ -757,8 +735,7 @@ private:
         if(b < 0)
             return step_result::need_input;
         opt_[opt_pos_++] = static_cast<std::uint8_t>(b);
-        header_crc_ = gzip_detail::crc32_update(header_crc_,
-                                                opt_.data() + opt_pos_ - 1, 1);
+        header_crc_.write(opt_.data() + opt_pos_ - 1, 1);
         if(opt_pos_ < opt_.size())
             return step_result::progress;
         extra_remaining_ = static_cast<std::size_t>(opt_[0])
@@ -779,7 +756,7 @@ private:
         if(b < 0)
             return step_result::need_input;
         const std::uint8_t v = static_cast<std::uint8_t>(b);
-        header_crc_ = gzip_detail::crc32_update(header_crc_, &v, 1);
+        header_crc_.write(&v, 1);
         --extra_remaining_;
         if(extra_remaining_ == 0)
             state_ = next_header_state();
@@ -792,7 +769,7 @@ private:
         if(b < 0)
             return step_result::need_input;
         const std::uint8_t v = static_cast<std::uint8_t>(b);
-        header_crc_ = gzip_detail::crc32_update(header_crc_, &v, 1);
+        header_crc_.write(&v, 1);
         if(v == 0)
             state_ = next_header_state();
         return step_result::progress;
@@ -808,7 +785,7 @@ private:
             return step_result::progress;
 
         const std::uint16_t expected =
-            static_cast<std::uint16_t>((header_crc_ ^ 0xFFFFFFFFu) & 0xFFFFu);
+            static_cast<std::uint16_t>(header_crc_.get() & 0xFFFFu);
         const std::uint16_t actual = static_cast<std::uint16_t>(
             static_cast<std::uint16_t>(opt_[0])
             | (static_cast<std::uint16_t>(opt_[1]) << 8));
@@ -1151,7 +1128,7 @@ private:
         flush_crc(c);
         const std::uint32_t stored_crc = le32(trailer_.data());
         const std::uint32_t stored_size = le32(trailer_.data() + 4);
-        if((crc_ ^ 0xFFFFFFFFu) != stored_crc)
+        if(crc_.get() != stored_crc)
             return fail(gzip_errc::crc_mismatch);
         if(output_size_ != stored_size)
             return fail(gzip_errc::size_mismatch);

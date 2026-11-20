@@ -15,6 +15,8 @@
 #include<type_traits>
 #include<utility>
 
+#include"crc.h"
+
 namespace xeno
 {
 
@@ -635,8 +637,8 @@ private:
     bool data_in_crc_ = false;
     bool discard_ = false;
     std::uint8_t data_end_ = 0;
-    std::uint16_t data_crc16_ = 0;
-    std::uint32_t data_crc32_ = 0xFFFFFFFFu;
+    crc16_xmodem data_crc16_;
+    crc32_iso_hdlc data_crc32_;
     std::size_t data_crc_pos_ = 0;
 
     hdr_state hs_ = hdr_state::search;
@@ -644,8 +646,8 @@ private:
     bool hdr_32_ = false;
     std::uint8_t hdr_buf_[HEADER_BYTES + 4]{};
     std::size_t hdr_pos_ = 0;
-    std::uint16_t hdr_crc16_ = 0;
-    std::uint32_t hdr_crc32_ = 0xFFFFFFFFu;
+    crc16_xmodem hdr_crc16_;
+    crc32_iso_hdlc hdr_crc32_;
     int hex_nibble_ = -1;
     int can_count_ = 0;
     bool hex_lf_ = false;
@@ -806,23 +808,6 @@ private:
             throw failed{};
     }
 
-    static std::uint16_t crc16_byte(std::uint16_t crc, std::uint8_t c)
-    {
-        crc ^= static_cast<std::uint16_t>(c) << 8;
-        for(int i = 0; i < 8; ++i)
-            crc = (crc & 0x8000) ? static_cast<std::uint16_t>((crc << 1) ^ 0x1021)
-                                 : static_cast<std::uint16_t>(crc << 1);
-        return crc;
-    }
-
-    static std::uint32_t crc32_byte(std::uint32_t crc, std::uint8_t c)
-    {
-        crc ^= c;
-        for(int i = 0; i < 8; ++i)
-            crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320u : crc >> 1;
-        return crc;
-    }
-
     static std::size_t position(const header &h)
     {
         return static_cast<std::size_t>(h.info[0]) |
@@ -860,7 +845,7 @@ private:
     // 发送 hex 头。type + info 用 CRC16，格式与 lrzsz 的 zshhdr 一致。
     void send_hex_header(this auto &&self, std::uint8_t type, const std::uint8_t info[4])
     {
-        std::uint16_t crc = 0;
+        crc16_xmodem crc;
         self.put_byte(ZPAD);
         self.put_byte(ZPAD);
         self.put_byte(ZDLE);
@@ -868,14 +853,15 @@ private:
 
         type &= 0x7F;
         self.put_hex_digit(type);
-        crc = crc16_byte(crc, type);
+        crc.write(type);
         for(int i = 0; i < 4; ++i)
         {
             self.put_hex_digit(info[i]);
-            crc = crc16_byte(crc, info[i]);
+            crc.write(info[i]);
         }
-        self.put_hex_digit(static_cast<std::uint8_t>(crc >> 8));
-        self.put_hex_digit(static_cast<std::uint8_t>(crc));
+        const std::uint16_t value = crc.get();
+        self.put_hex_digit(static_cast<std::uint8_t>(value >> 8));
+        self.put_hex_digit(static_cast<std::uint8_t>(value));
 
         self.put_byte('\r');
         self.put_byte('\n');
@@ -965,8 +951,8 @@ private:
     {
         hdr_32_ = crc32;
         hdr_pos_ = 0;
-        hdr_crc16_ = 0;
-        hdr_crc32_ = 0xFFFFFFFFu;
+        hdr_crc16_.reset();
+        hdr_crc32_.reset();
         hex_nibble_ = -1;
     }
 
@@ -975,9 +961,9 @@ private:
         if(hdr_pos_ < sizeof(hdr_buf_))
             hdr_buf_[hdr_pos_++] = c;
         if(hdr_32_)
-            hdr_crc32_ = crc32_byte(hdr_crc32_, c);
+            hdr_crc32_.write(c);
         else
-            hdr_crc16_ = crc16_byte(hdr_crc16_, c);
+            hdr_crc16_.write(c);
     }
 
     void commit_header(header &h)
@@ -995,9 +981,9 @@ private:
     {
         bool ok;
         if(hdr_32_)
-            ok = hdr_crc32_ == CRC32_RESIDUE;
+            ok = hdr_crc32_.raw() == CRC32_RESIDUE;
         else
-            ok = hdr_crc16_ == 0;
+            ok = hdr_crc16_.raw() == 0;
         if(!ok)
         {
             hs_ = hdr_state::search;
@@ -1136,7 +1122,7 @@ private:
                 self.header_append(v);
                 if(self.hdr_pos_ == 7)
                 {
-                    if(self.hdr_crc16_ != 0)
+                    if(self.hdr_crc16_.raw() != 0)
                     {
                         self.hs_ = hdr_state::search;
                         return hdr_status::error;
@@ -1180,8 +1166,8 @@ private:
         data_len_ = 0;
         data_in_crc_ = false;
         data_end_ = 0;
-        data_crc16_ = 0;
-        data_crc32_ = 0xFFFFFFFFu;
+        data_crc16_.reset();
+        data_crc32_.reset();
         data_crc_pos_ = 0;
         es_ = esc_state::normal;
     }
@@ -1192,8 +1178,8 @@ private:
         es_ = esc_state::normal;
         hdr_32_ = false;
         hdr_pos_ = 0;
-        hdr_crc16_ = 0;
-        hdr_crc32_ = 0xFFFFFFFFu;
+        hdr_crc16_.reset();
+        hdr_crc32_.reset();
         hex_nibble_ = -1;
         can_count_ = 0;
         hex_lf_ = false;
@@ -1221,34 +1207,34 @@ private:
                     self.data_in_crc_ = true;
                     self.data_crc_pos_ = 0;
                     if(self.data_32_)
-                        self.data_crc32_ = self.crc32_byte(self.data_crc32_, b);
+                        self.data_crc32_.write(b);
                     else
-                        self.data_crc16_ = self.crc16_byte(self.data_crc16_, b);
+                        self.data_crc16_.write(b);
                     continue;
                 }
                 if(self.data_len_ >= MAX_BLOCK)
                     return data_status::error;
                 self.buf_[self.data_len_++] = static_cast<std::byte>(b);
                 if(self.data_32_)
-                    self.data_crc32_ = self.crc32_byte(self.data_crc32_, b);
+                    self.data_crc32_.write(b);
                 else
-                    self.data_crc16_ = self.crc16_byte(self.data_crc16_, b);
+                    self.data_crc16_.write(b);
                 continue;
             }
 
             if(r == byte_status::frame_end)
                 return data_status::error;
             if(self.data_32_)
-                self.data_crc32_ = self.crc32_byte(self.data_crc32_, b);
+                self.data_crc32_.write(b);
             else
-                self.data_crc16_ = self.crc16_byte(self.data_crc16_, b);
+                self.data_crc16_.write(b);
             ++self.data_crc_pos_;
 
             std::size_t need = self.data_32_ ? 4 : 2;
             if(self.data_crc_pos_ == need)
             {
-                bool ok = self.data_32_ ? self.data_crc32_ == CRC32_RESIDUE
-                                        : self.data_crc16_ == 0;
+                bool ok = self.data_32_ ? self.data_crc32_.raw() == CRC32_RESIDUE
+                                        : self.data_crc16_.raw() == 0;
                 if(!ok)
                     return data_status::error;
                 end = self.data_end_;

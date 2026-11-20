@@ -1,7 +1,7 @@
 # xeno::ymodem_receiver 使用说明
 
-单文件 YMODEM-1K 接收端，header-only，位于 `xeno/toolkit/include/xeno/ymodem.h`。
-支持 SOH(128B) / STX(1KB) 帧、CRC16/XMODEM、Block 0 文件名与大小解析。
+YMODEM-1K 接收端，header-only，位于 `xeno/toolkit/include/xeno/ymodem.h`，依赖
+`xeno/crc.h`。支持 SOH(128B) / STX(1KB) 帧、CRC16/XMODEM、Block 0 文件名与大小解析。
 
 所有文件内容都按原始二进制交付，不做 CR/LF 或字符集转换。不支持未知文件大小。
 
