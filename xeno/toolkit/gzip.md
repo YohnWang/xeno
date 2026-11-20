@@ -5,39 +5,43 @@
 RFC 1952 gzip 容器，结束前校验 trailer 的 CRC32 与 ISIZE。
 
 ```cpp
-template<std::size_t N, std::size_t W = 32768>
+template<std::size_t N, std::size_t W = 32768, bool Static = false>
 class gzdecoder_basic;
 
-using gzdecore  = gzdecoder_basic<4096>;
-using gzdecoder = gzdecore;
+using gzdecoder        = gzdecoder_basic<4096>;
+using gzdecoder_static = gzdecoder_basic<4096, 32768, true>;
 ```
 
 - `N`：压缩输入环的大小，`write()` 把原始 gzip 字节写进这块缓冲区。
 - `W`：DEFLATE 历史窗口大小，默认 32768（标准最大值）。RAM 紧张时可以缩小，
   但距离超过 `W` 的合法流会报 `distance_too_far`。
+- `Static`：`false`（默认）时 arena 在构造时从堆上一次分配；`true` 时
+  arena 内联在对象里，零堆分配。两种模式的解码算法完全一致，类内部统一
+  通过 `arena()` 访问。
 
 解压器是单成员的：trailer 校验通过即 `finished()==true`，不支持
 `cat a.gz b.gz` 这种串联成员，成员之后的字节会被忽略。
 
 ## 快速开始
 
-对象本身包含 32 KiB 窗口和约 2 KiB 码表，N=4096 时约 39 KiB。栈空间紧张
-（多数 MCU 的默认任务栈）时用 `std::make_unique` 把整个对象放到堆上：
+输入环、窗口、Huffman 表和动态长度都放在一个 `gz_arena` 里。默认
+`Static=false` 时，arena 在构造时一次性从堆分配，解码器对象本身很小
+（N=4096 时实测 168 B），可以直接放栈上：
 
 ```cpp
-#include<memory>
 #include<xeno/gzip.h>
 
-auto dec = std::make_unique<xeno::gzdecore>();
+xeno::gzdecoder dec; // 小对象 + 一次约 39 KiB 的 arena 分配
 ```
 
-也可以放在 static/全局区：
+完全不想用堆时使用静态变体，arena 内联在对象里：
 
 ```cpp
-static xeno::gzdecore dec;
+static xeno::gzdecoder_static dec; // 约 39.5 KiB，放 .bss，零堆分配
 ```
 
-内部不再做堆分配；`make_unique` 是唯一一次分配。
+默认的 `gzdecoder` 对象很小，可以放栈上；`gzdecoder_static` 约 39.5 KiB，
+必须放 static/全局，不要作为 MCU 任务栈上的局部变量。
 
 ## 流式泵循环
 
@@ -47,7 +51,6 @@ static xeno::gzdecore dec;
 ```cpp
 #include<algorithm>
 #include<cstdint>
-#include<memory>
 #include<span>
 #include<xeno/gzip.h>
 
@@ -55,7 +58,7 @@ static xeno::gzdecore dec;
 int pump_gzip(std::span<const std::uint8_t> gz,
               int (*consume)(const void *, std::size_t))
 {
-    auto dec = std::make_unique<xeno::gzdecore>();
+    xeno::gzdecoder dec;
     std::uint8_t out[512];
     std::size_t pos = 0;
 
@@ -63,14 +66,14 @@ int pump_gzip(std::span<const std::uint8_t> gz,
     {
         if(pos < gz.size())
         {
-            int w = dec->write(gz.data() + pos,
+            int w = dec.write(gz.data() + pos,
                                std::min<std::size_t>(gz.size() - pos, 1024));
             if(w < 0)                       // 格式错误 / finished 后误写
                 return -1;
             pos += static_cast<std::size_t>(w);
         }
 
-        int r = dec->read(out, sizeof out);
+        int r = dec.read(out, sizeof out);
         if(r < 0)                           // CRC/ISIZE/码流错误
             return -2;
         if(r > 0)
@@ -80,7 +83,7 @@ int pump_gzip(std::span<const std::uint8_t> gz,
             continue;
         }
 
-        if(dec->finished())
+        if(dec.finished())
             return 0;
         if(pos == gz.size())
             return -4;                      // 输入已写完但未结束：文件被截断
@@ -96,7 +99,7 @@ int pump_gzip(std::span<const std::uint8_t> gz,
   用 `finished()` 区分。
 - 单成员模式下，输入写完但 `finished()==false` 就是截断；解码器不会单独报
   `truncated`。
-- 出错后看 `error()`，用 `xeno::to_string(dec->error())` 打印原因。
+- 出错后看 `error()`，用 `xeno::to_string(dec.error())` 打印原因。
   `read` 出错时 dst 中可能已有部分数据，不应使用。
 - 复用：`reset()` 后可以解压下一个 gzip，不需要重新分配对象。
 
@@ -113,13 +116,13 @@ while((n = fread(in, 1, sizeof in, fp)) > 0)
     std::size_t off = 0;
     while(off < n)
     {
-        int w = dec->write(in + off, n - off);
+        int w = dec.write(in + off, n - off);
         if(w < 0)
-            return -1;  // dec->error() 给出原因
+            return -1;  // dec.error() 给出原因
         off += static_cast<std::size_t>(w);
 
         int r;
-        while((r = dec->read(out, sizeof out)) > 0)
+        while((r = dec.read(out, sizeof out)) > 0)
             consume(out, static_cast<std::size_t>(r));
         if(r < 0)
             return -2;
@@ -129,19 +132,25 @@ while((n = fread(in, 1, sizeof in, fp)) > 0)
 
 // EOF 后把剩余输出读完
 int r;
-while((r = dec->read(out, sizeof out)) > 0)
+while((r = dec.read(out, sizeof out)) > 0)
     consume(out, static_cast<std::size_t>(r));
 if(r < 0)
     return -2;
-if(!dec->finished())
+if(!dec.finished())
     return -4;  // 截断：输入已写完但未校验 trailer
 ```
 
 ## 公共接口
 
 ```cpp
+using arena_type   = gzip_detail::gz_arena<N, W>;
+using storage_type = gzip_detail::arena_storage<arena_type, Static>;
+
 static constexpr std::size_t input_capacity;   // = N
 static constexpr std::size_t window_capacity;  // = W
+static constexpr std::size_t arena_bytes;      // = N + W
+
+gzdecoder_basic() noexcept(Static); // 动态构造可能分配，静态不分配
 
 int write(const void *src, std::size_t len) noexcept;
 int read(void *dst, std::size_t len) noexcept;
@@ -191,18 +200,22 @@ constexpr std::string_view to_string(gzip_errc) noexcept;
 
 ## 内存与性能
 
-默认 `gzdecore` 的内存组成：
+默认 `gzdecoder`（N=4096）的内存组成：
 
-| 部分 | 大小 |
-|---|---|
-| DEFLATE 历史窗口 `W` | 32768 B |
-| 压缩输入环 `N` | 4096 B |
-| 哈夫曼表（9/6/7 位主 LUT + canonical 回退） | 约 2.1 KiB |
-| 其他状态 | 约 200 B |
-| CRC32 表 | 1 KiB rodata（不占 RAM） |
+| 部分 | 动态（默认） | 静态 |
+|---|---|---|
+| 解码器对象 `sizeof` | 168 B | 约 39.5 KiB |
+| arena（输入 + 窗口 + 表 + dyn_lengths） | 堆上约 39.4 KiB，一次分配 | 对象内联，同一块 |
+| 其中 DEFLATE 窗口 `W` | 32768 B | 同左 |
+| 其中压缩输入环 `N` | 4096 B | 同左 |
+| 其中 Huffman 表（9/6/7 位 LUT） | 约 2.1 KiB | 同左 |
+| 其中 `dyn_lengths` | 320 B | 同左 |
+| CRC32 表 | 1 KiB rodata | 同左 |
 
-约 39 KiB。窗口和输入环是对象内的数组，构造/reset 不需要清空，内部计数保证
-旧内容不可达。
+动态版本构造时分配一次 arena，之后 `reset()` 复用，不重复分配；静态版本
+零堆分配。`bytes` 不主动清零，所有读取由 `in_used_` / `win_filled_` 界定；
+表和 `dyn_lengths` 有默认初始化。精确的 `sizeof` 由 `test/gzip_bench.cc`
+打印。
 
 实现上的取舍：
 
@@ -212,6 +225,8 @@ constexpr std::string_view to_string(gzip_errc) noexcept;
 - 回溯匹配逐字节复制，天然支持 `distance < length` 的重叠匹配；这是正确性
   优先的选择，长匹配没有做非重叠批量拷贝快路径。
 - 输入环满时 `write` 返回 0，不会阻塞或内部循环解码。
+- 动态/静态 arena 使用完全相同的解码路径；host benchmark 中两者吞吐接近，
+  差异主要在构造分配和内存位置。
 
 ## 限制与注意事项
 
@@ -227,8 +242,16 @@ constexpr std::string_view to_string(gzip_errc) noexcept;
   标准 gzip 文件可能合法地使用更大的距离，默认值请保持 32768。
 - **严格性**：保留 FLG 位和非法 gzip magic 都会报错；FTEXT 只提示文本内容，
   被忽略；FNAME/FCOMMENT 被跳过，不暴露给调用方；FHCRC 存在时会校验。
-- 对象较大，不要直接作为大局部变量。用 `std::make_unique<gzdecore>()`、
-  static/全局，或把对象放在专门的静态存储区。
+- **动态/静态放置**：默认 `gzdecoder` 对象很小，arena 一次堆分配；动态
+  版本 move-only，移动后源对象不可用。`gzdecoder_static` 约 39.5 KiB，
+  零堆分配，放 static/全局，不要放 MCU 任务栈；静态版本可 copy/move
+  （arena 值拷贝）。
+- **全局对象**：全局的 `gzdecoder`（动态）会在静态初始化阶段分配 arena；
+  无堆全局请用 `gzdecoder_static`。
+- **异常**：动态 arena 分配失败抛 `std::bad_alloc`；`-fno-exceptions`
+  构建下会终止。静态版本不分配。
+- **复用**：连续处理多个 gzip 时用 `reset()` 复用同一个 decoder，避免
+  重复分配 arena。
 
 ## 测试向量生成
 
@@ -264,7 +287,7 @@ def member(data, level=6, strategy=zlib.Z_DEFAULT_STRATEGY,
 
 主机端测试位于 `test/gzip_test.cc`，用 zlib 生成参考数据，覆盖 stored/fixed/
 dynamic、32 KiB 距离、可选头字段、CRC/ISIZE 错误、手工构造的畸形 deflate、
-缩减窗口、随机分块和 API 边界：
+缩减窗口、随机分块、动态/静态 arena 变体和 API 边界：
 
 ```bash
 g++-16 -std=gnu++26 -O2 -Wall -Wextra -Wpedantic \
@@ -272,10 +295,18 @@ g++-16 -std=gnu++26 -O2 -Wall -Wextra -Wpedantic \
 /tmp/gzip_test
 ```
 
-ARM 编译检查（不链接 zlib）：
+动态/静态 arena 的构造时间、`sizeof` 和解压吞吐对比：
 
 ```bash
-printf '#include<xeno/gzip.h>\n#include<memory>\nvoid f(){ auto d=std::make_unique<xeno::gzdecore>(); char b[16]; d->write("",0); d->read(b,sizeof b); }\n' \
+g++-16 -std=gnu++26 -O2 -DNDEBUG -Wall -Wextra -Wpedantic \
+    -I xeno/toolkit/include test/gzip_bench.cc -lz -o /tmp/gzip_bench
+/tmp/gzip_bench
+```
+
+ARM 编译检查（不链接 zlib，同时实例化动态和静态变体）：
+
+```bash
+printf '#include<xeno/gzip.h>\nvoid f(){ xeno::gzdecoder d; static xeno::gzdecoder_static s; char b[16]; (void)d.write("",0); (void)d.read(b,sizeof b); (void)s.write("",0); (void)s.read(b,sizeof b); }\n' \
   | arm-none-eabi-g++ -std=gnu++26 -Os -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard \
       -fno-exceptions -fno-rtti -I xeno/toolkit/include -x c++ - -c -o /tmp/gzip_arm.o
 ```

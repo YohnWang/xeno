@@ -5,6 +5,7 @@
 #include<climits>
 #include<cstddef>
 #include<cstdint>
+#include<memory>
 #include<string_view>
 
 namespace xeno
@@ -122,15 +123,71 @@ inline constexpr std::array<std::uint8_t, 19> code_length_order{
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 };
 
+template<std::size_t A, std::size_t P>
+struct huffman_table
+{
+    // (len << 9) | symbol；0 表示该前缀没有 <= P 位的码，需要 canonical 回退。
+    std::array<std::uint16_t, std::size_t{1} << P> lut_{};
+    std::array<std::uint16_t, 16> counts_{};
+    std::array<std::uint16_t, A> symbols_{}; // 按 (长度, 符号) 排序
+    std::uint8_t max_len_ = 0;               // 0 仅对空 distance 树合法
+};
+
+// 解码器的全部大块数据：输入环、历史窗口、哈夫曼表、动态长度。
+template<std::size_t N, std::size_t W>
+struct gz_arena
+{
+    std::array<std::uint8_t, N + W> bytes; // 输入 [0, N)，窗口 [N, N+W)
+    huffman_table<288, 9> litlen;
+    huffman_table<32, 6> dist;
+    huffman_table<19, 7> codelen;
+    std::array<std::uint8_t, 288 + 32> dyn_lengths{};
+};
+
+// 把 arena 的存放方式封装起来；gzdecoder_basic 只通过 get() 访问，
+// 内部不区分动态/静态。
+template<class Arena, bool Static>
+class arena_storage;
+
+template<class Arena>
+class arena_storage<Arena, false>
+{
+public:
+    arena_storage()
+        : arena_(new Arena) // default-init：不清零 bytes
+    {
+    }
+
+    Arena &get() noexcept { return *arena_; }
+    const Arena &get() const noexcept { return *arena_; }
+
+private:
+    std::unique_ptr<Arena> arena_;
+};
+
+template<class Arena>
+class arena_storage<Arena, true>
+{
+public:
+    arena_storage() noexcept = default;
+
+    Arena &get() noexcept { return arena_; }
+    const Arena &get() const noexcept { return arena_; }
+
+private:
+    Arena arena_;
+};
+
 } // namespace gzip_detail
 
 // gzip 流式解压器。
 //
 // N 是压缩输入环的大小，W 是 DEFLATE 历史窗口大小（默认标准 32 KiB）。
+// Static=false（默认）时 arena 在构造时从堆上一次分配，对象本身很小；
+// Static=true 时 arena 内联在对象里（约 39 KiB），零堆分配。
 // write() 分块写入压缩数据，read() 分块取出解压数据；两者都不阻塞。
-// 对象约 32 KiB + N + 2 KiB，栈空间紧张时用 std::make_unique<gzdecore>()
-// 或 static/全局对象创建。
-template<std::size_t N, std::size_t W = 32768>
+// 动态对象可直接放栈上；静态对象请放 static/全局，不要放 MCU 任务栈。
+template<std::size_t N, std::size_t W = 32768, bool Static = false>
 class gzdecoder_basic
 {
     static_assert(N > 0, "gzdecoder_basic: input buffer must not be empty");
@@ -158,17 +215,6 @@ class gzdecoder_basic
         ok,
         need_input,
         invalid,
-    };
-
-    template<std::size_t A, std::size_t P>
-    struct huffman_table
-    {
-        // (len << 9) | symbol；0 表示该前缀没有 <= P 位的码，需要 canonical 回退。
-        std::array<std::uint16_t, std::size_t{1} << P> lut_{};
-        std::array<std::uint16_t, 16> counts_{};
-        std::array<std::uint16_t, A> symbols_{}; // 按 (长度, 符号) 排序
-        std::uint16_t symbol_count_ = 0;
-        std::uint8_t max_len_ = 0;               // 0 仅对空 distance 树合法
     };
 
     enum class state : std::uint8_t
@@ -204,10 +250,15 @@ class gzdecoder_basic
     };
 
 public:
+    using arena_type   = gzip_detail::gz_arena<N, W>;
+    using storage_type = gzip_detail::arena_storage<arena_type, Static>;
+
     static constexpr std::size_t input_capacity  = N;
     static constexpr std::size_t window_capacity = W;
+    static constexpr std::size_t arena_bytes     = N + W;
 
-    gzdecoder_basic() noexcept = default;
+    // 动态版本可能抛 std::bad_alloc；静态版本 noexcept。
+    gzdecoder_basic() noexcept(Static) {}
 
     // 写入压缩数据；返回实际接收的字节数，输入环满时返回 0，失败/已结束时返回 -1。
     [[nodiscard]] int write(const void *src, std::size_t len) noexcept
@@ -235,10 +286,11 @@ public:
             return 0;
 
         const auto *p = static_cast<const std::uint8_t *>(src);
+        std::uint8_t *in = in_data();
         const std::size_t first = std::min(take, N - in_tail_);
-        std::copy_n(p, first, in_.data() + in_tail_);
+        std::copy_n(p, first, in + in_tail_);
         if(take > first)
-            std::copy_n(p + first, take - first, in_.data());
+            std::copy_n(p + first, take - first, in);
         in_tail_ += take;
         if(in_tail_ >= N)
             in_tail_ -= N;
@@ -310,7 +362,6 @@ public:
         dyn_phase_ = 0;
         cl_lengths_ = {};
         cl_index_ = 0;
-        dyn_lengths_ = {};
         dyn_index_ = 0;
         dyn_total_ = 0;
         last_length_ = 0;
@@ -328,8 +379,14 @@ public:
     }
 
 private:
+    storage_type storage_;
+
+    arena_type &arena() noexcept { return storage_.get(); }
+    const arena_type &arena() const noexcept { return storage_.get(); }
+    std::uint8_t *in_data() noexcept { return arena().bytes.data(); }
+    std::uint8_t *window_data() noexcept { return arena().bytes.data() + N; }
+
     // ---- 输入环 ----
-    std::array<std::uint8_t, N> in_;
     std::size_t in_head_ = 0;
     std::size_t in_tail_ = 0;
     std::size_t in_used_ = 0;
@@ -339,7 +396,6 @@ private:
     std::uint8_t bit_count_ = 0;
 
     // ---- 历史窗口；win_filled_ 界定有效区 ----
-    std::array<std::uint8_t, W> window_;
     std::size_t win_pos_ = 0;
     std::size_t win_filled_ = 0;
 
@@ -364,17 +420,9 @@ private:
     std::uint8_t dyn_phase_ = 0;
     std::array<std::uint8_t, 19> cl_lengths_{};
     std::uint8_t cl_index_ = 0;
-    // litlen 长度放在 [0, 288)，distance 长度放在 [288, 320)。
-    // 两块都先清零，避免固定字母表大小的构建读到上一块的残留。
-    std::array<std::uint8_t, 288 + 32> dyn_lengths_{};
     std::uint16_t dyn_index_ = 0; // 打包序列中的位置
     std::uint16_t dyn_total_ = 0;
     std::uint8_t last_length_ = 0;
-
-    // ---- 哈夫曼表 ----
-    huffman_table<288, 9> litlen_;
-    huffman_table<32, 6> dist_;
-    huffman_table<19, 7> codelen_;
 
     // ---- 可跨 read() 恢复的符号/匹配状态 ----
     std::uint16_t pending_len_symbol_ = 0;
@@ -397,7 +445,8 @@ private:
     {
         if(in_used_ == 0)
             return false;
-        bits_ |= static_cast<std::uint64_t>(in_[in_head_]) << bit_count_;
+        const std::uint8_t *in = in_data();
+        bits_ |= static_cast<std::uint64_t>(in[in_head_]) << bit_count_;
         in_head_ = (in_head_ + 1 == N) ? 0 : in_head_ + 1;
         --in_used_;
         bit_count_ = static_cast<std::uint8_t>(bit_count_ + 8);
@@ -433,7 +482,8 @@ private:
         }
         if(in_used_ == 0)
             return -1;
-        const std::uint8_t b = in_[in_head_];
+        const std::uint8_t *in = in_data();
+        const std::uint8_t b = in[in_head_];
         in_head_ = (in_head_ + 1 == N) ? 0 : in_head_ + 1;
         --in_used_;
         return b;
@@ -447,10 +497,10 @@ private:
     }
 
     // ---- 输出 ----
-    void emit(std::uint8_t b, read_ctx &c) noexcept
+    void emit(std::uint8_t b, read_ctx &c, std::uint8_t *window) noexcept
     {
         c.dst[c.produced++] = b;
-        window_[win_pos_] = b;
+        window[win_pos_] = b;
         win_pos_ = (win_pos_ + 1 == W) ? 0 : win_pos_ + 1;
         if(win_filled_ < W)
             ++win_filled_;
@@ -484,12 +534,12 @@ private:
 
     // ---- 哈夫曼 ----
     template<std::size_t A, std::size_t P>
-    static bool build_table(huffman_table<A, P> &t, const std::uint8_t *lengths,
+    static bool build_table(gzip_detail::huffman_table<A, P> &t,
+                            const std::uint8_t *lengths,
                             tree_kind kind) noexcept
     {
         t.counts_.fill(0);
         t.lut_.fill(0);
-        t.symbol_count_ = 0;
         t.max_len_ = 0;
 
         std::uint8_t max_len = 0;
@@ -555,7 +605,6 @@ private:
                     t.symbols_[k++] = static_cast<std::uint16_t>(s);
             }
         }
-        t.symbol_count_ = k;
 
         constexpr std::uint16_t lut_size =
             static_cast<std::uint16_t>(std::size_t{1} << P);
@@ -585,7 +634,7 @@ private:
     }
 
     template<std::size_t A, std::size_t P>
-    decode_result decode_symbol(const huffman_table<A, P> &t,
+    decode_result decode_symbol(const gzip_detail::huffman_table<A, P> &t,
                                 std::uint16_t &sym) noexcept
     {
         if(t.max_len_ == 0)
@@ -787,9 +836,11 @@ private:
         }
         else if(type == 1)
         {
-            if(!build_table(litlen_, gzip_detail::fixed_litlen_lengths.data(),
+            if(!build_table(arena().litlen,
+                            gzip_detail::fixed_litlen_lengths.data(),
                             tree_kind::litlen)
-               || !build_table(dist_, gzip_detail::fixed_dist_lengths.data(),
+               || !build_table(arena().dist,
+                               gzip_detail::fixed_dist_lengths.data(),
                                tree_kind::distance))
             {
                 return fail(gzip_errc::invalid_huffman);
@@ -833,12 +884,13 @@ private:
 
     step_result step_stored_copy(read_ctx &c) noexcept
     {
+        std::uint8_t *window = window_data();
         while(stored_remaining_ != 0 && c.produced < c.limit)
         {
             const int b = get_byte_stream();
             if(b < 0)
                 return step_result::need_input;
-            emit(static_cast<std::uint8_t>(b), c);
+            emit(static_cast<std::uint8_t>(b), c, window);
             --stored_remaining_;
         }
         if(stored_remaining_ == 0)
@@ -897,10 +949,11 @@ private:
             ++cl_index_;
         }
 
-        if(!build_table(codelen_, cl_lengths_.data(), tree_kind::codelen))
+        if(!build_table(arena().codelen, cl_lengths_.data(),
+                        tree_kind::codelen))
             return fail(gzip_errc::invalid_huffman);
 
-        dyn_lengths_.fill(0);
+        arena().dyn_lengths.fill(0);
         dyn_index_ = 0;
         dyn_total_ = static_cast<std::uint16_t>(hlit_ + hdist_);
         last_length_ = 0;
@@ -914,11 +967,12 @@ private:
         {
             // 一次保证 codelen 符号 + 最坏 7 个重复 extra bits 都可用，
             // 避免符号已消费而 extra bits 不足时丢失位置。
-            if(!ensure_bits(static_cast<std::uint8_t>(codelen_.max_len_ + 7u)))
+            if(!ensure_bits(static_cast<std::uint8_t>(
+                   arena().codelen.max_len_ + 7u)))
                 return step_result::need_input;
 
             std::uint16_t sym = 0;
-            const decode_result r = decode_symbol(codelen_, sym);
+            const decode_result r = decode_symbol(arena().codelen, sym);
             if(r == decode_result::need_input)
                 return step_result::need_input;
             if(r == decode_result::invalid)
@@ -970,9 +1024,11 @@ private:
             last_length_ = fill;
         }
 
-        if(!build_table(litlen_, dyn_lengths_.data(), tree_kind::litlen))
+        if(!build_table(arena().litlen, arena().dyn_lengths.data(),
+                        tree_kind::litlen))
             return fail(gzip_errc::invalid_huffman);
-        if(!build_table(dist_, dyn_lengths_.data() + 288, tree_kind::distance))
+        if(!build_table(arena().dist, arena().dyn_lengths.data() + 288,
+                        tree_kind::distance))
             return fail(gzip_errc::invalid_huffman);
         state_ = state::symbol;
         return step_result::progress;
@@ -980,17 +1036,18 @@ private:
 
     void store_length(std::uint8_t value) noexcept
     {
+        auto &lengths = arena().dyn_lengths;
         if(dyn_index_ < hlit_)
-            dyn_lengths_[dyn_index_] = value;
+            lengths[dyn_index_] = value;
         else
-            dyn_lengths_[288u + (dyn_index_ - hlit_)] = value;
+            lengths[288u + (dyn_index_ - hlit_)] = value;
         ++dyn_index_;
     }
 
     step_result step_symbol(read_ctx &c) noexcept
     {
         std::uint16_t sym = 0;
-        const decode_result r = decode_symbol(litlen_, sym);
+        const decode_result r = decode_symbol(arena().litlen, sym);
         if(r == decode_result::need_input)
             return step_result::need_input;
         if(r == decode_result::invalid)
@@ -998,7 +1055,7 @@ private:
 
         if(sym < 256)
         {
-            emit(static_cast<std::uint8_t>(sym), c);
+            emit(static_cast<std::uint8_t>(sym), c, window_data());
             return step_result::progress;
         }
         if(sym == 256)
@@ -1032,7 +1089,7 @@ private:
     step_result step_distance() noexcept
     {
         std::uint16_t sym = 0;
-        const decode_result r = decode_symbol(dist_, sym);
+        const decode_result r = decode_symbol(arena().dist, sym);
         if(r == decode_result::need_input)
             return step_result::need_input;
         if(r == decode_result::invalid)
@@ -1066,12 +1123,13 @@ private:
 
     step_result step_match(read_ctx &c) noexcept
     {
+        std::uint8_t *window = window_data();
         while(match_remaining_ != 0 && c.produced < c.limit)
         {
             const std::size_t src = win_pos_ >= match_distance_
                 ? win_pos_ - match_distance_
                 : win_pos_ + W - match_distance_;
-            emit(window_[src], c);
+            emit(window[src], c, window);
             --match_remaining_;
         }
         if(match_remaining_ == 0)
@@ -1102,7 +1160,7 @@ private:
     }
 };
 
-using gzdecore  = gzdecoder_basic<4096>;
-using gzdecoder = gzdecore;
+using gzdecoder = gzdecoder_basic<4096>;
+using gzdecoder_static = gzdecoder_basic<4096, 32768, true>;
 
 } // namespace xeno
