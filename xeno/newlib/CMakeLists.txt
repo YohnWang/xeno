@@ -9,6 +9,7 @@ target_sources(xeno_newlib
         sbrk.cc
         signal.cc
         sleep.cc
+        stdlib.cc
         time.cc
         tls.cc
         unistd.cc
