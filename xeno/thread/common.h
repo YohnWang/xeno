@@ -2,6 +2,7 @@
 
 #include<FreeRTOS.h>
 #include<task.h>
+#include<xeno/critical.h>
 
 namespace xeno
 {
