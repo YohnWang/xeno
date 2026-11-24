@@ -31,6 +31,9 @@ if(!(cond)){__write_terminal("assertion failed in: ");\
 #include<limits.h>
 #include<mutex>
 
+#include<bits/futex.h>
+#include<xeno/critical.h>
+
 namespace xeno
 {
 
@@ -553,6 +556,365 @@ public:
     }
 
     // 写侧最近一次失败的错误码；只由写线程查询，成功不清零
+    int write_errno() const noexcept
+    {
+        return write_errno_;
+    }
+};
+
+// kfifo：单中断写 + 单任务读的字节环形缓冲。写端是中断，所以只保留非阻塞的
+// try_write；读端有 try_read/read_for/read，读满 n、EOF 或超时才返回。
+//
+// 上下文：
+//   - 写端（try_write/finish_write/write_errno/两个 finish 查询）可以在中断里调用，
+//     中断的优先级数值必须 >= configMAX_SYSCALL_INTERRUPT_PRIORITY；写端必须是
+//     单一、不可重入的上下文（不要从更高优先级中断再调写端）。
+//   - 读端阻塞在 futex 上，read/read_for 只能在任务里调用；读端只能是一个任务。
+//     clear()/reset() 也由读端调用（reset 要求写端空闲）。
+//   - 依赖 xeno_thread 后端（thread_single 的 futex 是桩，且不链接 FreeRTOS port 对象）。
+//
+// 临界区只做快照和提交，数据拷贝在 critical_lock 之外完成：SPSC 下写端只碰
+// [write_pos_, write_pos_+free)，读端只碰 [read_pos_, read_pos_+used)，两区间永不相交；
+// 未提交的写对读端不可见，未提交的读只让写端少看到空间。因此生产者中断的延迟与 N 无关。
+//
+// 内存序依赖单核、无 DMA：read_pos_/write_pos_/used_ 只在 critical_lock 内访问，
+// 锁的 BASEPRI 宏带 "memory" 屏障，锁外拷贝不会越过提交；event_ 是唯一的发布点
+// （锁内 release 存，读者 acquire）。多核或 DMA 场景需要重新设计。
+template <size_t N>
+class kfifo
+{
+    static_assert(N > 0, "kfifo: N must be positive");
+    static_assert(N <= static_cast<size_t>(INT_MAX), "kfifo: N must fit int");
+
+    std::array<unsigned char, N> buffer_;
+    size_t read_pos_ = 0;           // 读游标，[0, N)
+    size_t write_pos_ = 0;          // 写游标，[0, N)
+    size_t used_ = 0;               // 已提交字节数，[0, N]
+    std::atomic<bool> write_finished_{false};  // 写端永久结束
+    std::atomic<bool> read_finished_{false};   // 读端永久结束
+    int read_errno_ = 0;
+    int write_errno_ = 0;
+    int event_ = 0;                 // futex 事件字；写端在环形锁内推进
+
+    size_t free_space() const
+    {
+        return N - used_;
+    }
+
+    int fail_read(int e)
+    {
+        read_errno_ = e;
+        return -1;
+    }
+
+    int fail_write(int e)
+    {
+        write_errno_ = e;
+        return -1;
+    }
+
+    static size_t ring_add(size_t pos, size_t n) noexcept
+    {
+        pos += n;
+        if (pos >= N)
+            pos -= N;
+        return pos;
+    }
+
+    // 以下只做跨尾 memcpy，不改游标/used_；start ∈ [0, N)，0 <= n <= N
+    void copy_in_at(size_t start, const void *buf, size_t n)
+    {
+        if (n == 0)
+            return;
+        auto p = static_cast<const unsigned char *>(buf);
+        size_t first = n < N - start ? n : N - start;
+        std::memcpy(buffer_.data() + start, p, first);
+        if (n > first)
+            std::memcpy(buffer_.data(), p + first, n - first);
+    }
+
+    void copy_out_at(size_t start, void *buf, size_t n) const
+    {
+        if (n == 0)
+            return;
+        auto p = static_cast<unsigned char *>(buf);
+        size_t first = n < N - start ? n : N - start;
+        std::memcpy(p, buffer_.data() + start, first);
+        if (n > first)
+            std::memcpy(p + first, buffer_.data(), n - first);
+    }
+
+    // 以下要求持环形锁；拷贝已在锁外完成，这里只提交索引
+    void commit_write(size_t start, size_t k)
+    {
+        write_pos_ = ring_add(start, k);
+        used_ += k;
+    }
+
+    void commit_read(size_t start, size_t k)
+    {
+        read_pos_ = ring_add(start, k);
+        used_ -= k;
+    }
+
+    // 写端在环形锁内推进事件字，返回值用于解锁后的 __futex_wake
+    int bump_event_locked()
+    {
+        unsigned v = static_cast<unsigned>(__atomic_load_n(&event_, __ATOMIC_RELAXED));
+        int next = static_cast<int>(v + 1u);
+        __atomic_store_n(&event_, next, __ATOMIC_RELEASE);
+        return next;
+    }
+
+public:
+
+    // 尝试写入：写当前能写的字节数，返回实际写入数；完全没空间时 -1/EAGAIN
+    int try_write(const void *buf, size_t n)
+    {
+        if (n == 0)
+            return 0;
+        if (n > static_cast<size_t>(INT_MAX))
+            return fail_write(EINVAL);
+
+        size_t start, k;
+        {
+            critical_lock lock;
+            if (write_finished() || read_finished())
+                return fail_write(EPIPE);
+            k = free_space() < n ? free_space() : n;
+            if (k == 0)
+                return fail_write(EAGAIN);
+            start = write_pos_;
+        }
+
+        // 锁外拷贝；写端单一且不可重入，这块空间不会被别人占走
+        copy_in_at(start, buf, k);
+
+        int next;
+        {
+            critical_lock lock;
+            commit_write(start, k);
+            next = bump_event_locked();
+        }
+        __futex_wake(&event_, next);
+        return static_cast<int>(k);
+    }
+
+    // 永久结束写端：读端排空缓冲后得到 EOF（read 返回 0）；之后的写返回 -1/EPIPE
+    void finish_write()
+    {
+        int next;
+        {
+            critical_lock lock;
+            write_finished_.store(true, std::memory_order_relaxed);
+            next = bump_event_locked();
+        }
+        __futex_wake(&event_, next);
+    }
+
+    // 写端是否已永久结束；无锁查询
+    bool write_finished() const noexcept
+    {
+        return write_finished_.load(std::memory_order_relaxed);
+    }
+
+    // 尝试读取：读当前能读的字节数；排空后的 0 是 EOF，-1/EAGAIN 表示暂时没数据
+    int try_read(void *buf, size_t n)
+    {
+        if (n == 0)
+            return 0;
+        if (n > static_cast<size_t>(INT_MAX))
+            return fail_read(EINVAL);
+
+        size_t start, k;
+        {
+            critical_lock lock;
+            if (read_finished())
+                return fail_read(EPIPE);
+            if (write_finished() && used_ == 0)
+                return 0; // EOF
+            k = used_ < n ? used_ : n;
+            if (k == 0)
+                return fail_read(EAGAIN);
+            start = read_pos_;
+        }
+
+        copy_out_at(start, buf, k);
+
+        {
+            critical_lock lock;
+            commit_read(start, k);
+        }
+        return static_cast<int>(k);
+    }
+
+    // 指定时间内尝试读取：尽量读满 n；超时时返回已读出数，零进展才 -1/ETIMEDOUT
+    template <typename Rep, typename Period>
+    int read_for(const std::chrono::duration<Rep, Period> &d, void *buf, size_t n)
+    {
+        if (n == 0)
+            return 0;
+        if (n > static_cast<size_t>(INT_MAX))
+            return fail_read(EINVAL);
+        if (read_finished())
+            return fail_read(EPIPE);
+
+        auto p = static_cast<unsigned char *>(buf);
+        size_t done = 0;
+        bool expired = false;
+        auto deadline = std::chrono::steady_clock::now() + d;
+
+        for (;;)
+        {
+            int expected = 0;
+            size_t start = 0, k = 0;
+            bool wait = false;
+            {
+                critical_lock lock;
+                if (write_finished() && used_ == 0)
+                    return static_cast<int>(done); // 排空后 EOF，done 可为 0
+                if (used_ != 0)
+                {
+                    k = used_ < n - done ? used_ : n - done;
+                    start = read_pos_;
+                }
+                else if (expired || std::chrono::steady_clock::now() >= deadline)
+                {
+                    // 没有数据且要等：到这里才看截止时间
+                    if (done == 0)
+                        return fail_read(ETIMEDOUT);
+                    return static_cast<int>(done);
+                }
+                else
+                {
+                    expected = __atomic_load_n(&event_, __ATOMIC_ACQUIRE);
+                    wait = true;
+                }
+            }
+
+            if (wait)
+            {
+                auto remain = deadline - std::chrono::steady_clock::now();
+                if (remain <= std::chrono::steady_clock::duration::zero())
+                {
+                    expired = true;
+                    continue;
+                }
+                // 正数不足 1ms 向上取整，避免在截止前被误判超时
+                auto ms = std::chrono::ceil<std::chrono::milliseconds>(remain).count();
+                if (ms < 1)
+                    ms = 1;
+                if (__futex_timedwait(&event_, expected, ms) == ETIMEDOUT)
+                    expired = true;
+                continue;
+            }
+
+            copy_out_at(start, p + done, k);
+
+            {
+                critical_lock lock;
+                commit_read(start, k);
+            }
+            done += k;
+            if (done == n)
+                return static_cast<int>(done);
+        }
+    }
+
+    // 阻塞式读取：分块读满 n，直到完成或写端 finish 后读到 EOF
+    int read(void *buf, size_t n)
+    {
+        if (n == 0)
+            return 0;
+        if (n > static_cast<size_t>(INT_MAX))
+            return fail_read(EINVAL);
+        if (read_finished())
+            return fail_read(EPIPE);
+
+        auto p = static_cast<unsigned char *>(buf);
+        size_t done = 0;
+
+        for (;;)
+        {
+            int expected = 0;
+            size_t start = 0, k = 0;
+            bool wait = false;
+            {
+                critical_lock lock;
+                if (write_finished() && used_ == 0)
+                    return static_cast<int>(done); // 排空后 EOF，done 可为 0
+                if (used_ != 0)
+                {
+                    k = used_ < n - done ? used_ : n - done;
+                    start = read_pos_;
+                }
+                else
+                {
+                    expected = __atomic_load_n(&event_, __ATOMIC_ACQUIRE);
+                    wait = true;
+                }
+            }
+
+            if (wait)
+            {
+                __futex_wait(&event_, expected);
+                continue;
+            }
+
+            copy_out_at(start, p + done, k);
+
+            {
+                critical_lock lock;
+                commit_read(start, k);
+            }
+            done += k;
+            if (done == n)
+                return static_cast<int>(done);
+        }
+    }
+
+    // 永久结束读端：之后的新写和读返回 -1/EPIPE；不唤醒（读端只有自己）
+    void finish_read()
+    {
+        critical_lock lock;
+        read_finished_.store(true, std::memory_order_relaxed);
+    }
+
+    // 读端是否已永久结束；无锁查询
+    bool read_finished() const noexcept
+    {
+        return read_finished_.load(std::memory_order_relaxed);
+    }
+
+    // 清空缓冲数据；不动 finish 状态和 errno；只由读端调用
+    void clear()
+    {
+        critical_lock lock;
+        used_ = 0;
+        read_pos_ = 0;
+        write_pos_ = 0;
+    }
+
+    // 完整复位：清数据、finish 状态和 errno；调用时读、写两端必须都空闲（使用者保证）
+    void reset()
+    {
+        critical_lock lock;
+        used_ = 0;
+        read_pos_ = 0;
+        write_pos_ = 0;
+        write_finished_.store(false, std::memory_order_relaxed);
+        read_finished_.store(false, std::memory_order_relaxed);
+        read_errno_ = 0;
+        write_errno_ = 0;
+    }
+
+    // 读侧最近一次失败的错误码；只由读线程查询，成功不清零
+    int read_errno() const noexcept
+    {
+        return read_errno_;
+    }
+
+    // 写侧最近一次失败的错误码；只由写侧查询，成功不清零
     int write_errno() const noexcept
     {
         return write_errno_;
