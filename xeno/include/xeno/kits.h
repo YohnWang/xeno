@@ -566,20 +566,26 @@ public:
 // try_write；读端有 try_read/read_for/read，读满 n、EOF 或超时才返回。
 //
 // 上下文：
-//   - 写端（try_write/finish_write/write_errno/两个 finish 查询）可以在中断里调用，
-//     中断的优先级数值必须 >= configMAX_SYSCALL_INTERRUPT_PRIORITY；写端必须是
-//     单一、不可重入的上下文（不要从更高优先级中断再调写端）。
+//   - 写端（try_write/finish_write/write_errno/两个 finish 查询）只能在一个中断里
+//     调用，中断的优先级数值必须 >= configMAX_SYSCALL_INTERRUPT_PRIORITY；写端必须
+//     单一、不可重入（不要从别的中断再调写端）。没有并发读端时从任务里顺序调用仍然
+//     可用（测试如此），但不享受任何跨上下文保护。
 //   - 读端阻塞在 futex 上，read/read_for 只能在任务里调用；读端只能是一个任务。
 //     clear()/reset() 也由读端调用（reset 要求写端空闲）。
 //   - 依赖 xeno_thread 后端（thread_single 的 futex 是桩，且不链接 FreeRTOS port 对象）。
 //
-// 临界区只做快照和提交，数据拷贝在 critical_lock 之外完成：SPSC 下写端只碰
-// [write_pos_, write_pos_+free)，读端只碰 [read_pos_, read_pos_+used)，两区间永不相交；
-// 未提交的写对读端不可见，未提交的读只让写端少看到空间。因此生产者中断的延迟与 N 无关。
+// 读端用 critical_lock 保护 used_/read_pos_ 的快照和提交：BASEPRI 会同时挡住
+// PendSV 和写中断。写端不需要临界区：任务不能抢占中断，读端在锁外只做数据拷贝、
+// 不碰 used_/read_pos_，所以一次 try_write 的快照→拷贝→提交之间不可能有任务在跑；
+// PendSV/SysTick 的优先级也不会在写中断执行中切换任务。
 //
-// 内存序依赖单核、无 DMA：read_pos_/write_pos_/used_ 只在 critical_lock 内访问，
-// 锁的 BASEPRI 宏带 "memory" 屏障，锁外拷贝不会越过提交；event_ 是唯一的发布点
-// （锁内 release 存，读者 acquire）。多核或 DMA 场景需要重新设计。
+// 数据拷贝在临界区之外完成：SPSC 下写端只碰 [write_pos_, write_pos_+free)，
+// 读端只碰 [read_pos_, read_pos_+used)，两区间永不相交；未提交的写对读端不可见，
+// 未提交的读只让写端少看到空间。因此生产者中断的延迟与 N 无关。
+//
+// 内存序依赖单核、无 DMA：读端对 read_pos_/used_ 的访问都在 critical_lock 内；
+// 写端运行期间没有任务在跑，提交后由 event_ 的 release 存发布（读者 acquire）。
+// 多核、DMA 或任务里并发写的场景需要重新设计。
 template <size_t N>
 class kfifo
 {
@@ -594,7 +600,7 @@ class kfifo
     std::atomic<bool> read_finished_{false};   // 读端永久结束
     int read_errno_ = 0;
     int write_errno_ = 0;
-    int event_ = 0;                 // futex 事件字；写端在环形锁内推进
+    int event_ = 0;                 // futex 事件字；写端提交后推进（release 存）
 
     size_t free_space() const
     {
@@ -644,21 +650,22 @@ class kfifo
             std::memcpy(p + first, buffer_.data(), n - first);
     }
 
-    // 以下要求持环形锁；拷贝已在锁外完成，这里只提交索引
+    // 写端提交：只在写端中断里调用，拷贝已完成，这里只提交索引（不需要锁）
     void commit_write(size_t start, size_t k)
     {
         write_pos_ = ring_add(start, k);
         used_ += k;
     }
 
+    // 读端提交：要求持环形锁；拷贝已在锁外完成，这里只提交索引
     void commit_read(size_t start, size_t k)
     {
         read_pos_ = ring_add(start, k);
         used_ -= k;
     }
 
-    // 写端在环形锁内推进事件字，返回值用于解锁后的 __futex_wake
-    int bump_event_locked()
+    // 写端推进事件字（release 存，发布此前的提交和锁外拷贝），返回值用于 __futex_wake
+    int bump_event()
     {
         unsigned v = static_cast<unsigned>(__atomic_load_n(&event_, __ATOMIC_RELAXED));
         int next = static_cast<int>(v + 1u);
@@ -669,6 +676,7 @@ class kfifo
 public:
 
     // 尝试写入：写当前能写的字节数，返回实际写入数；完全没空间时 -1/EAGAIN
+    // 只在写端中断里调用；任务里顺序调用只用于无并发读端的测试
     int try_write(const void *buf, size_t n)
     {
         if (n == 0)
@@ -676,39 +684,29 @@ public:
         if (n > static_cast<size_t>(INT_MAX))
             return fail_write(EINVAL);
 
-        size_t start, k;
-        {
-            critical_lock lock;
-            if (write_finished() || read_finished())
-                return fail_write(EPIPE);
-            k = free_space() < n ? free_space() : n;
-            if (k == 0)
-                return fail_write(EAGAIN);
-            start = write_pos_;
-        }
+        // 不需要 critical_lock：任务不能抢占中断，读端锁外不碰 used_/read_pos_
+        if (write_finished() || read_finished())
+            return fail_write(EPIPE);
+        size_t k = free_space() < n ? free_space() : n;
+        if (k == 0)
+            return fail_write(EAGAIN);
+        size_t start = write_pos_;
 
-        // 锁外拷贝；写端单一且不可重入，这块空间不会被别人占走
+        // 写端单一且不可重入（中断不会被任务打断），这块空间不会被别人占走
         copy_in_at(start, buf, k);
 
-        int next;
-        {
-            critical_lock lock;
-            commit_write(start, k);
-            next = bump_event_locked();
-        }
+        commit_write(start, k);
+        int next = bump_event(); // release 存：提交先于唤醒可见
         __futex_wake(&event_, next);
         return static_cast<int>(k);
     }
 
     // 永久结束写端：读端排空缓冲后得到 EOF（read 返回 0）；之后的写返回 -1/EPIPE
+    // 只在写端中断里调用
     void finish_write()
     {
-        int next;
-        {
-            critical_lock lock;
-            write_finished_.store(true, std::memory_order_relaxed);
-            next = bump_event_locked();
-        }
+        write_finished_.store(true, std::memory_order_relaxed);
+        int next = bump_event(); // release 存：finished 先于唤醒可见
         __futex_wake(&event_, next);
     }
 
