@@ -1,14 +1,17 @@
 #pragma once
 
+#include<algorithm>
 #include<vector>
 #include<string>
+#include<tuple>
 #include<flat_map>
 #include<mutex>
-#include<experimental/scope>
+#include<new>
 
 #include<unistd.h>
 #include<fcntl.h>
 #include<sys/stat.h>
+#include<sys/dirent.h>
 #include<errno.h>
 
 #include"path.h"
@@ -17,6 +20,9 @@ namespace xeno
 {
 
 class vfs;
+
+// C++ 层和 C 层共用同一个 struct dirent
+using dirent = struct ::dirent;
 
 // interface filesystem
 class ifs
@@ -31,24 +37,36 @@ public:
         return *self.vfsptr;
     }
 
-    auto fget(this auto &&self, int fd)
-    {
-        return static_cast<std::remove_cvref_t<decltype(self)>::file_type*>(self.vfs().fget(fd));
-    }
-
     virtual int open(const char *path, int mode) = 0;
     virtual int close(int fd) = 0;
 
     virtual int mkdir(const char *path, mode_t mode)
     {
+        errno = EROFS;
+        return -1;
+    }
+
+    virtual int rmdir(const char *path)
+    {
+        errno = EROFS;
+        return -1;
+    }
+
+    virtual int unlink(const char *path)
+    {
+        errno = EROFS;
         return -1;
     }
 
     virtual int rename(const char *oldpath, const char *newpath)
     {
-        errno = EACCES;
+        errno = EROFS;
         return -1;
     }
+
+    // 默认实现：open + fstat + close；有更直接办法的文件系统应当覆盖。
+    // 定义放在 vfs 之后（这里 vfs 还是前置声明）。
+    virtual int stat(const char *path, struct stat *buf);
 };
 
 class ifile
@@ -87,6 +105,7 @@ public:
 
     ifile() = default;
     ifile(xeno::ifs *pifs):ifsptr{pifs}{}
+    virtual ~ifile() = default;
 
     virtual int open(const char *path, int mode) = 0;
     virtual int close() = 0;
@@ -123,6 +142,14 @@ public:
     virtual int fstat(struct stat *buf)
     {
         errno = EIO;
+        return -1;
+    }
+
+    // 目录遍历：1=取到一项，0=目录读完，-1=错误。
+    // 游标属于本打开描述符；实现负责填 entry.d_ino/d_type/d_name。
+    virtual int readdir(xeno::dirent &entry)
+    {
+        errno = ENOTDIR;
         return -1;
     }
 };
@@ -214,42 +241,6 @@ public:
         {
             return v[fd];
         }
-        return nullptr;
-    }
-};
-
-class fdallocator
-{
-    std::flat_map<int, ifile*> pool;
-    int fd = 1000000;
-public:
-
-    int allocate(ifile *fs, int fd)
-    {
-        if(pool.contains(fd))
-            return -1;
-        pool[fd] = fs;
-        return fd;
-    }
-
-    int allocate(ifile *fs)
-    {
-        int r = fd++;
-        return allocate(fs, r);
-    }
-
-    int deallocate(int fd)
-    {
-        auto r = pool.erase(fd);
-        if(r == 0)
-            return -1;
-        return 0;
-    }
-
-    ifile* operator[](int fd)
-    {
-        if(pool.contains(fd))
-            return pool[fd];
         return nullptr;
     }
 };
@@ -363,7 +354,7 @@ public:
         return -1;
     }
 
-    int read(int fd, void *buf, size_t size)
+    ssize_t read(int fd, void *buf, size_t size)
     {
         ifile *file = get_ifile(fd);
         if(file)
@@ -374,7 +365,7 @@ public:
         return -1;
     }
 
-    int write(int fd, const void *buf, size_t size)
+    ssize_t write(int fd, const void *buf, size_t size)
     {
         ifile *file = get_ifile(fd);
         if(file)
@@ -396,7 +387,7 @@ public:
         return -1;
     }
 
-    int lseek(int fd, off_t offset, int whence)
+    off_t lseek(int fd, off_t offset, int whence)
     {
         ifile *file = get_ifile(fd);
         if(file)
@@ -418,17 +409,295 @@ public:
         return -1;
     }
 
-    int stat(const char *path, struct stat *buf)
+    // POSIX 目录接口
+    DIR *opendir(const char *pathname)
     {
-        int fd = open(path, O_RDONLY);
+        int fd = open(pathname, O_RDONLY | O_DIRECTORY);
         if(fd < 0)
-            return fd;
-        std::experimental::scope_exit _{[fd, this]{
+            return nullptr;
+
+        DIR *d = new(std::nothrow) DIR{};
+        if(d == nullptr)
+        {
             close(fd);
-        }};
-        return fstat(fd, buf);
+            errno = ENOMEM;
+            return nullptr;
+        }
+        d->fd = fd;
+        return d;
+    }
+
+    DIR *fdopendir(int fd)
+    {
+        struct stat buf;
+        if(fstat(fd, &buf) < 0)
+            return nullptr;
+        if(!S_ISDIR(buf.st_mode))
+        {
+            errno = ENOTDIR;
+            return nullptr;
+        }
+
+        DIR *d = new(std::nothrow) DIR{};
+        if(d == nullptr)
+        {
+            errno = ENOMEM;
+            return nullptr;
+        }
+        d->fd = fd;
+        return d;
+    }
+
+    xeno::dirent *readdir(DIR *dirp)
+    {
+        if(dirp == nullptr)
+        {
+            errno = EBADF;
+            return nullptr;
+        }
+
+        ifile *file = get_ifile(dirp->fd);
+        if(file == nullptr)
+        {
+            errno = EBADF;
+            return nullptr;
+        }
+
+        if(file->readdir(dirp->entry) != 1)
+            return nullptr; // 0=EOF 保持 errno；-1 由文件系统设置
+
+        return &dirp->entry;
+    }
+
+    int readdir_r(DIR *dirp, xeno::dirent *entry, xeno::dirent **result)
+    {
+        if(dirp == nullptr || entry == nullptr || result == nullptr)
+            return EINVAL;
+
+        errno = 0;
+        xeno::dirent *r = readdir(dirp);
+        if(r == nullptr)
+        {
+            int e = errno;
+            *result = nullptr;
+            return e;
+        }
+
+        *entry = *r;
+        *result = entry;
+        return 0;
+    }
+
+    int closedir(DIR *dirp)
+    {
+        if(dirp == nullptr)
+        {
+            errno = EBADF;
+            return -1;
+        }
+
+        int r = close(dirp->fd);
+        delete dirp;
+        return r;
+    }
+
+    void rewinddir(DIR *dirp)
+    {
+        if(dirp != nullptr)
+            lseek(dirp->fd, 0, SEEK_SET);
+    }
+
+    void seekdir(DIR *dirp, long loc)
+    {
+        if(dirp != nullptr)
+            lseek(dirp->fd, loc, SEEK_SET);
+    }
+
+    long telldir(DIR *dirp)
+    {
+        if(dirp == nullptr)
+        {
+            errno = EBADF;
+            return -1;
+        }
+        return (long)lseek(dirp->fd, 0, SEEK_CUR);
+    }
+
+    int dirfd(DIR *dirp)
+    {
+        if(dirp == nullptr)
+        {
+            errno = EBADF;
+            return -1;
+        }
+        return dirp->fd;
+    }
+
+    int mkdir(const char *pathname, mode_t mode)
+    {
+        if(pathname == nullptr)
+        {
+            errno = EFAULT;
+            return -1;
+        }
+
+        path p{pathname};
+        {
+            std::lock_guard _{mount_mutex};
+            if(mountpoints.contains(p))
+            {
+                errno = EEXIST;
+                return -1;
+            }
+        }
+
+        auto [fs, relative] = get_ifs_and_prefix(p);
+        if(fs == nullptr)
+        {
+            errno = ENOENT;
+            return -1;
+        }
+        return fs->mkdir(relative.c_str(), mode);
+    }
+
+    int rmdir(const char *pathname)
+    {
+        if(pathname == nullptr)
+        {
+            errno = EFAULT;
+            return -1;
+        }
+
+        path p{pathname};
+        {
+            std::lock_guard _{mount_mutex};
+            if(mountpoints.contains(p))
+            {
+                errno = EBUSY;
+                return -1;
+            }
+        }
+
+        auto [fs, relative] = get_ifs_and_prefix(p);
+        if(fs == nullptr)
+        {
+            errno = ENOENT;
+            return -1;
+        }
+        return fs->rmdir(relative.c_str());
+    }
+
+    int unlink(const char *pathname)
+    {
+        if(pathname == nullptr)
+        {
+            errno = EFAULT;
+            return -1;
+        }
+
+        path p{pathname};
+        {
+            std::lock_guard _{mount_mutex};
+            if(mountpoints.contains(p))
+            {
+                errno = EBUSY;
+                return -1;
+            }
+        }
+
+        auto [fs, relative] = get_ifs_and_prefix(p);
+        if(fs == nullptr)
+        {
+            errno = ENOENT;
+            return -1;
+        }
+        return fs->unlink(relative.c_str());
+    }
+
+    int rename(const char *oldpath, const char *newpath)
+    {
+        if(oldpath == nullptr || newpath == nullptr)
+        {
+            errno = EFAULT;
+            return -1;
+        }
+
+        path op{oldpath};
+        path np{newpath};
+        {
+            std::lock_guard _{mount_mutex};
+            if(mountpoints.contains(op) || mountpoints.contains(np))
+            {
+                errno = EBUSY;
+                return -1;
+            }
+        }
+
+        auto [ofs, orel] = get_ifs_and_prefix(op);
+        auto [nfs, nrel] = get_ifs_and_prefix(np);
+        if(ofs == nullptr || nfs == nullptr)
+        {
+            errno = ENOENT;
+            return -1;
+        }
+        if(ofs != nfs)
+        {
+            errno = EXDEV;
+            return -1;
+        }
+        return ofs->rename(orel.c_str(), nrel.c_str());
+    }
+
+    int stat(const char *pathname, struct stat *buf)
+    {
+        if(pathname == nullptr || buf == nullptr)
+        {
+            errno = EFAULT;
+            return -1;
+        }
+
+        path p{pathname};
+        auto [fs, relative] = get_ifs_and_prefix(p);
+        if(fs != nullptr)
+        {
+            if(fs->stat(relative.c_str(), buf) == 0)
+                return 0;
+
+            int saved = errno;
+            // 挂载点本身必须表现为目录，即使被挂载的文件系统不支持 stat
+            std::lock_guard _{mount_mutex};
+            if(mountpoints.contains(p))
+            {
+                *buf = {};
+                buf->st_mode = S_IFDIR | 0555;
+                buf->st_nlink = 2;
+                return 0;
+            }
+            errno = saved;
+            return -1;
+        }
+
+        errno = ENOENT;
+        return -1;
     }
 
 };
+
+inline int ifs::stat(const char *path, struct stat *buf)
+{
+    int fd = open(path, O_RDONLY);
+    if(fd < 0)
+        return -1;
+
+    ifile *file = this->vfs().fget(fd);
+    int r = -1;
+    if(file != nullptr)
+        r = file->fstat(buf);
+    else
+        errno = EBADF;
+
+    close(fd);
+    return r;
+}
 
 }

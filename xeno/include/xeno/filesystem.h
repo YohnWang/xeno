@@ -2,6 +2,7 @@
 
 #include"filesystem/vfs.h"
 #include"filesystem/devfs.h"
+#include"filesystem/ramfs.h"
 #include"filesystem/stdio_file.h"
 #include"filesystem/ioctl.h"
 
@@ -27,7 +28,15 @@ inline auto& __get_devfs()
     return *ptr;
 }
 
+inline auto& __get_ramfs()
+{
+    alignas(xeno::ramfs) static char buf[sizeof(xeno::ramfs)];
+    static xeno::ramfs *ptr = new(buf) xeno::ramfs;
+    return *ptr;
+}
+
 #define __vfs xeno::__get_vfs()
 #define __devfs xeno::__get_devfs()
+#define __ramfs xeno::__get_ramfs()
 
 }

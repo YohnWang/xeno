@@ -67,6 +67,25 @@ public:
     auto operator<=>(const path &p) const = default;
     bool operator==(const path &p) const = default;
 
+    bool is_root() const
+    {
+        return npath == "/";
+    }
+
+    path parent_path() const
+    {
+        std::string s = npath;
+        remove_basename(s);
+        return path{s};
+    }
+
+    // 返回最后一段文件名；根目录返回空 view
+    std::string_view filename() const
+    {
+        auto pos = npath.find_last_of('/');
+        return std::string_view{npath}.substr(pos + 1);
+    }
+
     operator std::string() const
     {
         return npath;

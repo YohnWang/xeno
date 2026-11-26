@@ -7,7 +7,13 @@ namespace xeno
 void filesystem_init()
 {
     static std::once_flag flag;
-    std::call_once(flag, [](){__vfs.mount(__devfs, "/dev/");});
+    std::call_once(flag, [](){
+        // ramfs 作为根文件系统；先在 ramfs 里建出 /dev，再把 devfs 挂上去，
+        // 这样 readdir("/") 也能看到 dev。
+        __vfs.mount(__ramfs, "/");
+        __vfs.mkdir("/dev", 0755);
+        __vfs.mount(__devfs, "/dev");
+    });
 }
 
 void filesystem_init_stdio()

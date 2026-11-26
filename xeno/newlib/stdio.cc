@@ -1,4 +1,5 @@
 #include<xeno/filesystem.h>
+#include<dirent.h>
 #include<reent.h>
 #include<unistd.h>
 
@@ -45,4 +46,49 @@ int _fstat_r(struct _reent *ptr, int fd, struct stat *st)
 int _stat_r(struct _reent *ptr, const char * pathname, struct stat * statbuf)
 {
     return __vfs.stat(pathname, statbuf);
+}
+
+extern "C" DIR *opendir(const char *name)
+{
+    return __vfs.opendir(name);
+}
+
+extern "C" DIR *fdopendir(int fd)
+{
+    return __vfs.fdopendir(fd);
+}
+
+extern "C" struct dirent *readdir(DIR *dirp)
+{
+    return __vfs.readdir(dirp);
+}
+
+extern "C" int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result)
+{
+    return __vfs.readdir_r(dirp, entry, result);
+}
+
+extern "C" int closedir(DIR *dirp)
+{
+    return __vfs.closedir(dirp);
+}
+
+extern "C" void rewinddir(DIR *dirp)
+{
+    __vfs.rewinddir(dirp);
+}
+
+extern "C" void seekdir(DIR *dirp, long loc)
+{
+    __vfs.seekdir(dirp, loc);
+}
+
+extern "C" long telldir(DIR *dirp)
+{
+    return __vfs.telldir(dirp);
+}
+
+extern "C" int dirfd(DIR *dirp)
+{
+    return __vfs.dirfd(dirp);
 }
